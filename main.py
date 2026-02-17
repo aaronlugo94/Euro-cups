@@ -14,13 +14,13 @@ import traceback
 from datetime import datetime, timedelta
 from collections import Counter
 
-# --- CONFIGURACIÓN v86.1 (WIN-FIRST ELITE) ---
+# --- CONFIGURACIÓN v87.0 (WIN-FIRST OPERATOR MODE) ---
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-RUN_TIME = "02:50" 
+RUN_TIME = "02:54" 
 
 # AJUSTES DE MODELO
 SIMULATION_RUNS = 20000 
@@ -41,12 +41,9 @@ MANUAL_MATCHES = [
 # --- 💾 PERSISTENCIA ---
 VOLUME_PATH = "/app/data" 
 if os.path.exists(VOLUME_PATH):
-    HISTORY_FILE = os.path.join(VOLUME_PATH, "historial_omni_v86.csv")
+    HISTORY_FILE = os.path.join(VOLUME_PATH, "historial_omni_v87.csv")
 else:
-    HISTORY_FILE = "historial_omni_v86.csv"
-
-# GESTIÓN DE RIESGO (MODO CONSERVADOR)
-MAX_STAKE_PCT = 0.03 # Tope máximo 3% (Stake Plano)
+    HISTORY_FILE = "historial_omni_v87.csv"
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -85,8 +82,8 @@ class OmniHybridBot:
         self.handicap_buffer = [] 
         self.global_db = {} 
         
-        print("--- ENGINE v86.1 WIN-FIRST STARTED ---", flush=True)
-        self.send_msg(f"🔧 <b>INICIANDO v86.1</b>\n(Estrategia: Win-First / Flat Stake)\n📂 CSV: {HISTORY_FILE}")
+        print("--- ENGINE v87.0 WIN-FIRST STARTED ---", flush=True)
+        self.send_msg(f"🔧 <b>INICIANDO v87.0</b>\n(Win-First Mode | Prob > 60%)\n📂 CSV: {HISTORY_FILE}")
         self._init_history_file()
         
         self.ai_client = None
@@ -286,28 +283,37 @@ class OmniHybridBot:
         candidates = []
         
         def add(name, market, prob, odd, gcs=None):
-            # 1. FILTRO DE ODDS (Seguridad Primero)
-            # Descartamos basura (<1.45) y loterías (>2.20)
-            if odd < 1.45 or odd > 2.20: return 
+            # 1. FILTRO DE ODDS (Seguridad Primero: 1.50 - 2.10)
+            if odd < 1.50 or odd > 2.15: return 
             
-            # 2. FILTRO DE PROBABILIDAD (Win Rate)
-            # Si no hay 55% de chance real, no interesa el EV.
-            if prob < 0.55: return
+            # 2. FILTRO DE PROBABILIDAD (Win Rate > 60% obligatorio)
+            if prob < 0.60: return
 
             ev = (prob * odd) - 1
             
-            # 3. FILTRO DE MERCADO (Jerarquía)
-            # Penalizamos ML si no es "fijo". Premiamos DNB/DC.
-            if market == "1X2" and prob < 0.60: return
-            if market == "GOALS" and (not gcs or gcs < 60): return
-
-            # 4. SCORING HÍBRIDO
-            # Probabilidad pesa el doble que el EV.
-            score = (prob * 100)
-            if market in ["DNB", "Double Chance"]: score += 5 # Bono seguridad
+            # 3. FILTRO DE MERCADO Y CONTEXTO
+            # ML (1X2) es arriesgado, exige más certeza (>65%)
+            if market == "1X2" and prob < 0.65: return
             
-            # Validación EV (Solo para no agarrar valor negativo profundo)
-            if ev < -0.03: return # Permitimos EV levemente negativo si es DNB muy seguro
+            # Goals solo si GCS (Goal Confidence Score) es sólido
+            if market == "GOALS" and (not gcs or gcs < 58): return
+
+            # EV validación (No aceptamos EV muy negativo)
+            if ev < -0.02 or ev > 0.25: return
+
+            # 4. SCORING HÍBRIDO (Score = Probabilidad)
+            # El EV ya no multiplica el score, solo suma puntitos marginales
+            score = (prob * 100)
+            
+            # Bonos de Estructura (Priorizar DNB y DC)
+            if market == "DNB": score += 6
+            if market == "Double Chance": score += 5
+            
+            # Bono de Alta Certeza
+            if prob >= 0.68: score += 4
+            
+            # Bono de Valor (Marginal)
+            if ev > 0.03: score += min(ev * 30, 3)
             
             item = {'pick': name, 'market': market, 'prob': prob, 'odd': odd, 'ev': ev, 'score': score, 'status': "VALID", 'reason': "WIN-FIRST", 'gcs': gcs}
             candidates.append(item)
@@ -322,36 +328,36 @@ class OmniHybridBot:
         if odds['O25'] > 0:
             add("OVER 2.5 GOLES", "GOALS", sim['goals'][0], odds['O25'], sim['gcs'])
             add("UNDER 2.5 GOLES", "GOALS", 1-sim['goals'][0], 1 / (1 - (1/odds['O25'] * 1.05)), sim['gcs'])
-        if odds['BTTS_Y'] > 0:
-            add("BTTS SÍ", "BTTS", sim['goals'][1], odds['BTTS_Y'])
         
-        # Handicaps son solo secundarios ahora, no los mezclamos en candidates principales
-        ah_h_plus = sim['ah'][2]; ah_a_plus = sim['ah'][3]
+        # Handicaps solo como backup, nunca principal
         best_handi = None
+        ah_h_plus = sim['ah'][2]; ah_a_plus = sim['ah'][3]
         if ah_h_plus > 0.85: best_handi = {'pick': "HANDICAP H +1.5", 'odd': 1.15}
         elif ah_a_plus > 0.85: best_handi = {'pick': "HANDICAP A +1.5", 'odd': 1.15}
 
         if not candidates: return None, best_handi
         
-        # Ordenamos por SCORE (Probabilidad), no por EV
+        # Ordenamos por SCORE (Probabilidad Boosted), no por EV
         candidates.sort(key=lambda x: x['score'], reverse=True)
         return candidates[0], best_handi
 
-    # --- STAKE PLANO ESCALONADO ---
-    def get_kelly_stake(self, prob, odds, market, gcs=None):
-        # Base: 1.5% del bank
-        stake = 0.015
-        
-        # Tier 1: Probabilidad alta (>65%) -> Subimos a 2.0%
-        if prob > 0.65: stake = 0.02
-        
-        # Tier 2: Probabilidad muy alta (>75%) -> Subimos a 2.5%
-        if prob > 0.75: stake = 0.025
-        
-        # Penalización volatilidad
-        if market in ['GOALS', 'BTTS']: stake *= 0.80
-        
-        return min(stake, MAX_STAKE_PCT)
+    # --- STAKE ESCALONADO (NO KELLY) ---
+    def get_stake(self, prob, odds, market, gcs=None):
+        # Base conservadora: 1.0%
+        base = 0.01 
+
+        # Escalera de Confianza
+        if prob >= 0.65: base = 0.0125
+        if prob >= 0.70: base = 0.015
+
+        # Bono Mercados Seguros
+        if market in ["DNB", "Double Chance"]: base *= 1.1
+
+        # Penalización Volatilidad (Goles)
+        if market == 'GOALS': base *= 0.9
+
+        # Tope máximo de seguridad
+        return min(base, 0.02) # Max 2%
 
     def get_team_form_icon(self, df, team):
         matches = df[(df['HomeTeam'] == team) | (df['AwayTeam'] == team)].tail(5)
@@ -472,7 +478,6 @@ class OmniHybridBot:
 
     # --- OUTPUT PROCESSOR (TOP 5 + COPA) ---
     def process_match_output(self, div, rh, ra, data, sim, best_bet, best_handi, today):
-        # Filtro de Silencio: Si NO es Copa Y NO es Top 5, ignoramos.
         is_cup = (div == 'EU_CUP')
         if not is_cup and div not in TOP_5_LEAGUES:
             return 
@@ -483,10 +488,11 @@ class OmniHybridBot:
         if is_valid:
             status_line = "✅ <b>PICK ACTIVO</b>"
             gcs_val = best_bet.get('gcs', 0)
-            stake = self.get_kelly_stake(best_bet['prob'], best_bet['odd'], best_bet['market'], gcs_val)
+            # Usamos el nuevo sistema de stake plano
+            stake = self.get_stake(best_bet['prob'], best_bet['odd'], best_bet['market'], gcs_val)
             stake_txt = f"{stake*100:.2f}%"
             tag = "[VALID]"
-            self.daily_picks_buffer.append(f"{tag} {rh} vs {ra}: {best_bet['pick']} @ {best_bet['odd']:.2f} (EV: {best_bet['ev']*100:.1f}%)")
+            self.daily_picks_buffer.append(f"{tag} {rh} vs {ra}: {best_bet['pick']} @ {best_bet['odd']:.2f} (Prob: {best_bet['prob']*100:.1f}%)")
         else:
             status_line = f"🚫 <b>NO BET</b> ({best_bet['reason']})"
             stake = 0.0; stake_txt = "Skipped"
@@ -505,7 +511,7 @@ class OmniHybridBot:
         league_name = LEAGUE_CONFIG.get(div, {'name': '🏆 COPA EUROPA'})['name']
 
         msg = (
-            f"🛡️ <b>ANÁLISIS v86</b> | {league_name}\n"
+            f"🛡️ <b>ANÁLISIS v87</b> | {league_name}\n"
             f"⚽ <b>{rh}</b> {form_h} vs {form_a} <b>{ra}</b>\n"
             f"───────────────\n"
             f"{status_line}\n"
@@ -542,7 +548,7 @@ class OmniHybridBot:
         self.daily_picks_buffer = [] 
         self.handicap_buffer = []
         today = datetime.now().strftime('%d/%m/%Y')
-        print(f"🚀 Iniciando v86.1 WIN-FIRST: {today}", flush=True)
+        print(f"🚀 Iniciando v87.0 WIN-FIRST: {today}", flush=True)
         
         print("🌍 Cargando DB Global...", flush=True)
         for div in LEAGUE_CONFIG:
@@ -574,7 +580,6 @@ class OmniHybridBot:
                     m_weight = LEAGUE_CONFIG[div].get('m_weight', 0.70)
                     sim = self.simulate_match(rh, ra, data, m_odds, m_weight)
                     min_ev = LEAGUE_CONFIG[div].get('min_ev', 0.02)
-                    # Min EV League lo pasamos, pero dentro de find_best_value tenemos nuestra lógica Win-First
                     best_bet, best_handi = self.find_best_value(sim, m_odds, min_ev)
                     self.process_match_output(div, rh, ra, data, sim, best_bet, best_handi, today)
         except: pass
