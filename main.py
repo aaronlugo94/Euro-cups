@@ -20,7 +20,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-RUN_TIME = "03:22" 
+RUN_TIME = "03:24" 
 
 # AJUSTES DE MODELO
 SIMULATION_RUNS = 20000 
@@ -35,7 +35,7 @@ MANUAL_MATCHES = [
     ('Benfica', 'Real Madrid'),
     ('Qarabag FK', 'Newcastle'),
     ('Olympiacos', 'Leverkusen'),
-    ('Bodo/Glimt', 'Inter')
+    ('Bodo/Glimt', 'Inter'),
     ('Club Brugge', 'Atletico Madrid')
 ]
 
