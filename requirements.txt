@@ -1,4 +1,4 @@
-renpho-weight
+renpho
 google-genai
 requests
 pytz
