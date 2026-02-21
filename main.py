@@ -41,7 +41,7 @@ def sanitizar_markdown(texto):
     return texto
 
 def obtener_datos_renpho():
-    log("🔄 Extrayendo datos de Renpho...")
+    log("🔄 Extrayendo datos de Renpho (Modo Escáner Profundo)...")
     try:
         cliente = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
         mediciones = None
@@ -66,91 +66,24 @@ def obtener_datos_renpho():
         if not mediciones:
             raise ValueError("La API devolvió una lista vacía.")
 
+        # Ordenar por el más reciente
         mediciones = sorted(mediciones, key=lambda x: x.get("time_stamp", 0), reverse=True)
         ultima = mediciones[0]
         
-        peso = ultima.get("weight")
-        grasa = ultima.get("bodyfat") or ultima.get("fat") 
-        musculo = ultima.get("muscle")
-
-        if peso is None or grasa is None or musculo is None:
-            raise ValueError(f"Medición incompleta.\nRaw: {ultima}")
-
-        return round(peso, 2), round(grasa, 2), round(musculo, 2)
+        # 🔥 EL TRUCO: Forzamos un error intencional enviando todo el diccionario convertido a texto
+        data_cruda = json.dumps(ultima, indent=2)
+        raise ValueError(f"🚨 DATA CRUDA DESCUBIERTA:\n{data_cruda}")
 
     except Exception as e:
-        raise RuntimeError(f"Fallo crítico en Renpho: {e}")
+        raise RuntimeError(f"{e}")
 
 def manejar_historial(peso, grasa, musculo):
-    directorio_volumen = "/app/data"
-    ruta_archivo = os.path.join(directorio_volumen, "metrics.json")
-    log(f"💾 Gestionando histórico en: {ruta_archivo}")
-    
-    hoy_date = datetime.now(TZ).date()
-    hoy = str(hoy_date)
-    ayer = str(hoy_date - timedelta(days=1))
-    data = {}
-
-    os.makedirs(directorio_volumen, exist_ok=True)
-
-    if os.path.exists(ruta_archivo):
-        try:
-            with open(ruta_archivo, "r") as f:
-                data = json.load(f)
-        except json.JSONDecodeError:
-            log("⚠️ Archivo JSON corrupto. Se sobrescribirá.")
-
-    datos_ayer = data.get(ayer)
-
-    if hoy in data:
-        log("ℹ️ Ya existe una medición para hoy, protegiendo JSON.")
-        # 🔥 TRUCO: Devolvemos False temporalmente para que el main() no se detenga hoy
-        return datos_ayer, False 
-
-    data[hoy] = {"peso": peso, "grasa": grasa, "musculo": musculo}
-
-    try:
-        with open(ruta_archivo, "w") as f:
-            json.dump(data, f, indent=2)
-        log("✅ Histórico actualizado correctamente.")
-    except Exception as e:
-        raise RuntimeError(f"Error al escribir Volumen: {e}")
-
-    return datos_ayer, False
+    # En este modo escáner, el código no llegará aquí porque explotará arriba a propósito.
+    return None, False
 
 def analizar_con_ia(peso, grasa, musculo, datos_ayer):
-    log("🧠 Ejecutando prompt en Gemini (v2.0)...")
-    client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
-    
-    comparativa = ""
-    if datos_ayer:
-        diff_peso = round(peso - datos_ayer['peso'], 2)
-        signo = "+" if diff_peso > 0 else ""
-        comparativa = f"\nContexto histórico: Ayer pesaste {datos_ayer['peso']} kg (Diferencia: {signo}{diff_peso} kg)."
-
-    prompt = f"""
-    Datos corporales de hoy:
-    - Peso: {peso} kg
-    - Grasa corporal: {grasa} %
-    - Masa muscular: {musculo} kg{comparativa}
-
-    Actúa como entrenador y nutriólogo.
-    Responde SOLO en este formato exacto, sin texto adicional:
-
-    📊 Diagnóstico (máx 2 líneas, objetivo y directo)
-    🎯 Acción concreta hoy (1 frase)
-    🔥 Motivación breve (1 frase)
-    """
-    
-    try:
-        # 🔥 Actualizado al modelo más reciente y estable
-        respuesta = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt
-        )
-        return respuesta.text.strip()
-    except Exception as e:
-        raise RuntimeError(f"Fallo en generación de IA: {e}")
+    # En este modo escáner, el código no llegará aquí.
+    return "Dummy"
 
 def enviar_telegram(mensaje):
     if DRY_RUN:
@@ -159,9 +92,11 @@ def enviar_telegram(mensaje):
 
     log("📲 Transmitiendo a Telegram...")
     url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
+    
+    # Aquí usamos HTML temporalmente porque el JSON crudo puede romper el Markdown de Telegram
     r = requests.post(
         url,
-        json={"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "Markdown"},
+        json={"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje},
         timeout=10
     )
 
@@ -174,34 +109,16 @@ def enviar_telegram(mensaje):
 
 def main():
     try:
+        # Esto va a fallar intencionalmente y nos mandará la data cruda
         peso, grasa, musculo = obtener_datos_renpho()
-        datos_ayer, ya_existia = manejar_historial(peso, grasa, musculo)
         
-        if ya_existia:
-            log("ℹ️ Pipeline detenido por idempotencia.")
-            return
-        
-        analisis_raw = analizar_con_ia(peso, grasa, musculo, datos_ayer)
-        analisis_seguro = sanitizar_markdown(analisis_raw)
-        
-        mensaje_final = (
-            f"📈 *Reporte Diario de Composición*\n\n"
-            f"⚖️ Peso: `{peso} kg`\n"
-            f"🥓 Grasa: `{grasa} %`\n"
-            f"💪 Músculo: `{musculo} kg`\n\n"
-            f"🤖 *Diagnóstico IA:*\n{analisis_seguro}"
-        )
-        
-        enviar_telegram(mensaje_final)
-        log("✅ Pipeline completado exitosamente.")
-
     except Exception as e:
-        error_msg = f"🔴 *Falla en Sistema de Salud*\nError: `{str(e)}`"
-        log(error_msg)
+        error_msg = f"🔴 *Reporte del Escáner Renpho*\n\n{str(e)}"
+        log("Atrapado el escáner, enviando a Telegram...")
         try:
             enviar_telegram(error_msg)
-        except:
-            log("Fallo catastrófico con Telegram.")
+        except Exception as telegram_error:
+            log(f"Fallo catastrófico con Telegram: {telegram_error}")
 
 if __name__ == "__main__":
     main()
