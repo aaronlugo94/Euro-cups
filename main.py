@@ -4,18 +4,17 @@ import requests
 import pytz
 from datetime import datetime, timedelta
 
-# Importaciones corregidas para las nuevas librerías
+# Nuevas librerías
 from google import genai
-from renpho_weight import RenphoWeight
+import renpho
 
 # ==========================================
 # 0. CONFIGURACIÓN BASE Y LOGGING
 # ==========================================
-TZ = pytz.timezone("America/Phoenix") # Zona horaria blindada (Tucson/Phoenix)
+TZ = pytz.timezone("America/Phoenix") 
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 def log(msg):
-    """Log estructurado simple con timestamp local."""
     timestamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {msg}")
 
@@ -38,71 +37,75 @@ if not all(env_vars.values()):
 # ==========================================
 
 def sanitizar_markdown(texto):
-    """Evita que caracteres generados por la IA rompan el parse_mode de Telegram."""
     return texto.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+def obtener_clase_renpho():
+    """Busca dinámicamente la clase correcta dentro del paquete instalado."""
+    if hasattr(renpho, 'RenphoWeight'): return renpho.RenphoWeight
+    if hasattr(renpho, 'Renpho'): return renpho.Renpho
+    if hasattr(renpho, 'RenphoAPI'): return renpho.RenphoAPI
+    
+    # Si está en un submódulo (muy común en PyPI)
+    try:
+        from renpho.renpho import Renpho
+        return Renpho
+    except ImportError:
+        pass
+        
+    # Si falla todo, explotamos con gracia e imprimimos el contenido de la librería
+    raise RuntimeError(f"Clase no encontrada. Contenido del módulo renpho: {dir(renpho)}")
 
 def obtener_datos_renpho():
     log("🔄 Extrayendo datos de Renpho...")
     try:
-        # Usamos la clase correcta del nuevo paquete renpho-weight
-        cliente = RenphoWeight(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
+        RenphoClient = obtener_clase_renpho()
+        cliente = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
         mediciones = cliente.get_measurements()
         
         if not mediciones:
             raise ValueError("La API de Renpho devolvió una lista vacía de mediciones.")
 
-        # Ordenar explícitamente por timestamp
         mediciones = sorted(mediciones, key=lambda x: x.get("time_stamp", 0), reverse=True)
         ultima = mediciones[0]
         
-        # Ojo: renpho-weight usa 'bodyfat' en lugar de 'fat' a veces
         peso = ultima.get("weight")
         grasa = ultima.get("bodyfat") or ultima.get("fat") 
         musculo = ultima.get("muscle")
 
         if peso is None or grasa is None or musculo is None:
-            raise ValueError(f"Medición incompleta detectada: Peso={peso}, Grasa={grasa}, Músculo={musculo}\nData raw: {ultima}")
+            raise ValueError(f"Medición incompleta: Peso={peso}, Grasa={grasa}, Músculo={musculo}\nRaw: {ultima}")
 
         return round(peso, 2), round(grasa, 2), round(musculo, 2)
 
     except Exception as e:
-        raise RuntimeError(f"Fallo crítico en la extracción de Renpho: {e}")
+        raise RuntimeError(f"Fallo crítico en Renpho: {e}")
 
 def manejar_historial(peso, grasa, musculo):
     directorio_volumen = "/app/data"
     ruta_archivo = os.path.join(directorio_volumen, "metrics.json")
     log(f"💾 Gestionando histórico en: {ruta_archivo}")
     
-    # Uso de la zona horaria correcta para evitar saltos de día por UTC
     hoy_date = datetime.now(TZ).date()
     hoy = str(hoy_date)
     ayer = str(hoy_date - timedelta(days=1))
     data = {}
 
-    # 1. Asegurar que el directorio del Volumen existe
     os.makedirs(directorio_volumen, exist_ok=True)
 
-    # 2. Leer archivo existente
     if os.path.exists(ruta_archivo):
         try:
             with open(ruta_archivo, "r") as f:
                 data = json.load(f)
         except json.JSONDecodeError:
-            log("⚠️ Archivo JSON corrupto o vacío. Se sobrescribirá.")
+            log("⚠️ Archivo JSON corrupto. Se sobrescribirá.")
 
     datos_ayer = data.get(ayer)
 
-    # 3. Idempotencia: Proteger contra doble ejecución el mismo día
     if hoy in data:
         log("ℹ️ Ya existe una medición para hoy, omitiendo escritura para proteger datos.")
         return datos_ayer
 
-    # 4. Guardar datos de hoy
-    data[hoy] = {
-        "peso": peso,
-        "grasa": grasa,
-        "musculo": musculo
-    }
+    data[hoy] = {"peso": peso, "grasa": grasa, "musculo": musculo}
 
     try:
         with open(ruta_archivo, "w") as f:
@@ -115,8 +118,6 @@ def manejar_historial(peso, grasa, musculo):
 
 def analizar_con_ia(peso, grasa, musculo, datos_ayer):
     log("🧠 Ejecutando prompt determinista en Gemini (Nuevo SDK)...")
-    
-    # Nueva sintaxis obligatoria de Google GenAI
     client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
     
     comparativa = ""
@@ -140,7 +141,6 @@ def analizar_con_ia(peso, grasa, musculo, datos_ayer):
     """
     
     try:
-        # Nueva forma de llamar al modelo
         respuesta = client.models.generate_content(
             model='gemini-1.5-flash',
             contents=prompt
@@ -156,14 +156,9 @@ def enviar_telegram(mensaje):
 
     log("📲 Transmitiendo a Telegram...")
     url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
-    
     r = requests.post(
         url,
-        json={
-            "chat_id": env_vars["TELEGRAM_CHAT_ID"],
-            "text": mensaje,
-            "parse_mode": "Markdown"
-        },
+        json={"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "Markdown"},
         timeout=10
     )
 
@@ -199,7 +194,7 @@ def main():
         try:
             enviar_telegram(error_msg)
         except:
-            log("Fallo catastrófico: No se pudo conectar con Telegram.")
+            log("Fallo catastrófico con Telegram.")
 
 if __name__ == "__main__":
     main()
