@@ -37,35 +37,32 @@ if not all(env_vars.values()):
 # ==========================================
 
 def sanitizar_markdown(texto):
-    """Blindaje total para Telegram: escapa caracteres que podrían romper el parseo."""
+    """Blindaje total para Telegram."""
     for ch in ["_", "*", "`", "[", "]", "(", ")"]:
         texto = texto.replace(ch, f"\\{ch}")
     return texto
 
 def obtener_datos_renpho():
-    log("🔄 Extrayendo datos de Renpho...")
+    log("🔄 Ejecutando sonda de diagnóstico en RenphoClient...")
     try:
-        # Iniciar sesión directamente con la clase descubierta
+        # Iniciamos sesión
         cliente = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
-        mediciones = cliente.get_measurements()
         
-        if not mediciones:
-            raise ValueError("La API devolvió una lista vacía de mediciones.")
-
-        mediciones = sorted(mediciones, key=lambda x: x.get("time_stamp", 0), reverse=True)
-        ultima = mediciones[0]
+        # Escaneamos las entrañas del cliente
+        metodos = [m for m in dir(cliente) if callable(getattr(cliente, m)) and not m.startswith('_')]
+        propiedades = [m for m in dir(cliente) if not callable(getattr(cliente, m)) and not m.startswith('_')]
         
-        peso = ultima.get("weight")
-        grasa = ultima.get("bodyfat") or ultima.get("fat") 
-        musculo = ultima.get("muscle")
-
-        if peso is None or grasa is None or musculo is None:
-            raise ValueError(f"Medición incompleta: Peso={peso}, Grasa={grasa}, Músculo={musculo}\nRaw: {ultima}")
-
-        return round(peso, 2), round(grasa, 2), round(musculo, 2)
+        # Armamos un reporte y forzamos un error para que llegue a Telegram
+        diagnostico = (
+            f"🔍 *Diagnóstico de la API:*\n\n"
+            f"🛠️ *Métodos:* `{metodos}`\n\n"
+            f"📦 *Propiedades:* `{propiedades}`"
+        )
+        raise ValueError(diagnostico)
 
     except Exception as e:
-        raise RuntimeError(f"Fallo crítico en Renpho: {e}")
+        # Lo pasamos hacia arriba para que el main lo envíe
+        raise RuntimeError(f"{e}")
 
 def manejar_historial(peso, grasa, musculo):
     directorio_volumen = "/app/data"
@@ -88,9 +85,8 @@ def manejar_historial(peso, grasa, musculo):
 
     datos_ayer = data.get(ayer)
 
-    # Idempotencia total: Si ya existe, retornamos un flag "True" para detener el flujo
     if hoy in data:
-        log("ℹ️ Ya existe una medición para hoy, omitiendo escritura para proteger datos.")
+        log("ℹ️ Ya existe una medición para hoy, omitiendo escritura.")
         return datos_ayer, True
 
     data[hoy] = {"peso": peso, "grasa": grasa, "musculo": musculo}
@@ -105,7 +101,7 @@ def manejar_historial(peso, grasa, musculo):
     return datos_ayer, False
 
 def analizar_con_ia(peso, grasa, musculo, datos_ayer):
-    log("🧠 Ejecutando prompt en Gemini (Nuevo SDK)...")
+    log("🧠 Ejecutando prompt en Gemini...")
     client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
     
     comparativa = ""
@@ -159,14 +155,13 @@ def enviar_telegram(mensaje):
 
 def main():
     try:
+        # Esto va a "fallar" a propósito para darnos el diagnóstico
         peso, grasa, musculo = obtener_datos_renpho()
         
-        # Obtenemos los datos de ayer y el flag de si ya corrió hoy
         datos_ayer, ya_existia = manejar_historial(peso, grasa, musculo)
         
-        # Short-circuit: Si ya corrió, cortamos aquí para no gastar IA ni enviar spam
         if ya_existia:
-            log("ℹ️ Pipeline detenido por idempotencia. La medición de hoy ya fue procesada y enviada.")
+            log("ℹ️ Pipeline detenido por idempotencia.")
             return
         
         analisis_raw = analizar_con_ia(peso, grasa, musculo, datos_ayer)
@@ -184,7 +179,8 @@ def main():
         log("✅ Pipeline completado exitosamente.")
 
     except Exception as e:
-        error_msg = f"🔴 *Falla en Sistema de Salud*\nError: `{str(e)}`"
+        # El error de diagnóstico caerá aquí y te llegará por Telegram
+        error_msg = f"🔴 *Diagnóstico del Sistema*\n{str(e)}"
         log(error_msg)
         try:
             enviar_telegram(error_msg)
