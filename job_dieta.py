@@ -121,7 +121,7 @@ def ejecutar_job():
     if existe:
         logging.warning("⚠️ Job semanal ya ejecutado hoy. Abortando por idempotencia.")
         conn.close()
-        return
+        #return
     
     df = pd.read_sql_query("SELECT Fecha, Peso_kg, Grasa_Porcentaje, Musculo, FatFreeWeight, Agua, VisFat, BMI, EdadMetabolica FROM pesajes WHERE Fecha >= date('now', '-14 day') ORDER BY Fecha ASC", conn)
     conn.close()
