@@ -47,16 +47,19 @@ def enviar_mensaje_telegram(mensaje):
     if DRY_RUN: return logging.info(f"DRY RUN: {mensaje}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # Evitamos cortar etiquetas HTML por la mitad. 
-    # Telegram soporta 4096, cortamos de forma segura en 4000.
+    # 🧹 FILTRO SANITARIO: Telegram odia estas etiquetas. Las convertimos a texto normal.
+    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
+    
     texto_seguro = mensaje if len(mensaje) < 4000 else mensaje[:3900] + "\n\n[... Menú truncado por Telegram ...]"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texto_seguro, "parse_mode": "HTML"}
     
     res = requests.post(url, json=payload)
     if res.status_code != 200:
         logging.error(f"⚠️ Error HTML en Telegram: {res.text}. Enviando texto plano...")
-        payload["parse_mode"] = None # Apaga el validador estricto
-        requests.post(url, json=payload)
+        del payload["parse_mode"]  # <-- Esta es la forma correcta y blindada de quitarlo
+        res2 = requests.post(url, json=payload)
+        if res2.status_code != 200:
+            logging.error(f"⚠️ Error CRÍTICO en fallback: {res2.text}"))
 
 # ==========================================
 # LEYES DE CONTROL (MIMO SHADOW & SISO ACTIVO)
