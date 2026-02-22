@@ -53,7 +53,10 @@ def enviar_mensaje_telegram(mensaje):
     if DRY_RUN: return logging.info(f"DRY RUN: {mensaje}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n").replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
+    # 🧹 FILTRO SANITARIO AGRESIVO (Destruye listas, líneas, párrafos y títulos)
+    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
+    mensaje = mensaje.replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
+    mensaje = mensaje.replace("<h1>", "").replace("</h1>", "\n").replace("<h2>", "").replace("</h2>", "\n").replace("<h3>", "").replace("</h3>", "\n")
     
     partes = []
     while len(mensaje) > 0:
@@ -113,7 +116,7 @@ def aplicar_ley_de_control(delta_peso, kcal_mult_actual):
 def ejecutar_job():
     logging.info("Iniciando Job Semanal de Control Metabólico...")
     
-    # 🛡️ PROTECCIÓN DE IDEMPOTENCIA
+    # 🛡️ PROTECCIÓN DE IDEMPOTENCIA (ACTIVA)
     hoy = datetime.now(TZ).strftime("%Y-%m-%d")
     inicializar_bd(ARCHIVO_DB)
     conn = sqlite3.connect(ARCHIVO_DB)
@@ -175,7 +178,7 @@ def ejecutar_job():
     4. Desayunos: Ultra-rápidos (<5 mins) y portátiles para comer en el auto camino a la oficina.
     5. Snacks/Frutas: INCLUYE SIEMPRE 1 colación al día basada en FRUTAS FRESCAS para controlar antojos y dar vitaminas, ajustando las porciones de la cena para no pasarnos de calorías.
     
-    REGLA ESTRICTA DE FORMATO: Usa SOLO etiquetas <b> e <i> para resaltar. Usa saltos de línea reales (\\n) y guiones (-) para listas. PROHIBIDO usar <br>, <hr>, <ul>, <li> o cualquier otra etiqueta HTML."""
+    REGLA ESTRICTA DE FORMATO: Usa SOLO etiquetas <b> e <i> para resaltar. Usa saltos de línea reales (\\n) y guiones (-) para listas. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3>, <p> o cualquier otra etiqueta HTML."""
     
     try:
         client = genai.Client()
@@ -190,7 +193,7 @@ def ejecutar_job():
         f"📊 <b>Telemetría Semanal Completa:</b>\n"
         f"• Peso: {peso_actual:.1f} kg (Δ {delta_peso:+.2f} kg)\n"
         f"• Grasa: {grasa_actual:.1f}% (Δ {delta_grasa:+.2f} %)\n"
-        f"• Músculo: {musculo_actual_pct:.1f}% (Δ {delta_musculo_pct:+.2f} %)\n"
+        f"• Músculo Esquelético: {musculo_actual_pct:.1f}% (Δ {delta_musculo_pct:+.2f} %)\n"
         f"• Masa Libre de Grasa (FFM): {fat_free_weight:.1f} kg\n"
         f"• Agua Corporal: {agua_actual:.1f}%\n"
         f"• Grasa Visceral: {visfat_actual}\n"
