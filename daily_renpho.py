@@ -110,10 +110,11 @@ def analizar_con_ia(m, datos_ayer):
     - Agua: {m['agua']}% | Proteína: {m['proteina']}%
     - Edad Metabólica: {m['edad_metabolica']} años
     {contexto_ayer}
-    Actúa como experto en recomposición corporal. Responde SOLO en este formato estricto HTML (NO markdown):
-    <b>📊 Análisis Clínico:</b> (Breve impacto)<br><br>
-    <b>🎯 Acción del Día:</b> (Nutrición/Entrenamiento)<br><br>
-    <i>🔥 Foco: (1 frase motivadora)</i>"""
+    Actúa como experto en recomposición corporal. Responde SOLO en este formato estricto HTML:
+    <b>📊 Análisis Clínico:</b> (Breve impacto)\n\n
+    <b>🎯 Acción del Día:</b> (Nutrición/Entrenamiento)\n\n
+    <i>🔥 Foco: (1 frase motivadora)</i>
+    REGLA ESTRICTA: Usa SOLO etiquetas <b> e <i> para resaltar. PROHIBIDO usar <br>, <hr>, <ul>, <li> o cualquier otra etiqueta."""
     
     for intento in range(3):
         try:
@@ -126,13 +127,19 @@ def analizar_con_ia(m, datos_ayer):
 def enviar_telegram(mensaje):
     if DRY_RUN: return log(f"DRY RUN: {mensaje}")
     url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
+    
+    # 🧹 FILTRO SANITARIO AGRESIVO
+    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n").replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
+    
     payload = {"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "HTML"}
     
     res = requests.post(url, json=payload)
     if res.status_code != 200:
         log(f"⚠️ Telegram rechazó el HTML. Fallback a texto plano... Error: {res.text}")
-        payload["parse_mode"] = None  # Apaga el validador estricto de Telegram
-        requests.post(url, json=payload)
+        del payload["parse_mode"]
+        res2 = requests.post(url, json=payload)
+        if res2.status_code != 200:
+            log(f"⚠️ Error CRÍTICO en fallback: {res2.text}")
 
 def ejecutar_diario():
     try:
