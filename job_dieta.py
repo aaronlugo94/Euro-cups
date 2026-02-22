@@ -53,7 +53,7 @@ def enviar_mensaje_telegram(mensaje):
     if DRY_RUN: return logging.info(f"DRY RUN: {mensaje}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # 🧹 FILTRO SANITARIO AGRESIVO (Destruye listas, líneas, párrafos y títulos)
+    # 🧹 FILTRO SANITARIO AGRESIVO 
     mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
     mensaje = mensaje.replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
     mensaje = mensaje.replace("<h1>", "").replace("</h1>", "\n").replace("<h2>", "").replace("</h2>", "\n").replace("<h3>", "").replace("</h3>", "\n")
@@ -116,7 +116,7 @@ def aplicar_ley_de_control(delta_peso, kcal_mult_actual):
 def ejecutar_job():
     logging.info("Iniciando Job Semanal de Control Metabólico...")
     
-    # 🛡️ PROTECCIÓN DE IDEMPOTENCIA (ACTIVA)
+    # 🛡️ PROTECCIÓN DE IDEMPOTENCIA
     hoy = datetime.now(TZ).strftime("%Y-%m-%d")
     inicializar_bd(ARCHIVO_DB)
     conn = sqlite3.connect(ARCHIVO_DB)
@@ -126,7 +126,8 @@ def ejecutar_job():
         conn.close()
         return
     
-    df = pd.read_sql_query("SELECT Fecha, Peso_kg, Grasa_Porcentaje, Musculo, FatFreeWeight, Agua, VisFat, BMI, EdadMetabolica FROM pesajes WHERE Fecha >= date('now', '-14 day') ORDER BY Fecha ASC", conn)
+    # ⬇️ AQUI AGREGAMOS BMR A LA CONSULTA SQL ⬇️
+    df = pd.read_sql_query("SELECT Fecha, Peso_kg, Grasa_Porcentaje, Musculo, FatFreeWeight, Agua, VisFat, BMI, EdadMetabolica, BMR FROM pesajes WHERE Fecha >= date('now', '-14 day') ORDER BY Fecha ASC", conn)
     conn.close()
 
     if df.empty or len(df) < 2:
@@ -144,6 +145,7 @@ def ejecutar_job():
     agua_actual = float(dato_actual['Agua'])
     visfat_actual = float(dato_actual['VisFat'])
     edad_metabolica = int(dato_actual['EdadMetabolica'])
+    bmr_actual = int(dato_actual['BMR']) # ⬅️ EXTRAEMOS EL BMR
     
     delta_peso = peso_actual - float(dato_anterior['Peso_kg'])
     delta_grasa = grasa_actual - float(dato_anterior['Grasa_Porcentaje'])
@@ -167,16 +169,19 @@ def ejecutar_job():
     grasas = round(peso_actual * 0.7) 
     carbs = max(0, round((calorias - (proteina * 4 + grasas * 9)) / 4))
 
+    # 🧠 EL CEREBRO ACTUALIZADO CON CANDADO DE SEGURIDAD BASAL
     prompt = f"""Eres mi nutriólogo deportivo y entrenador personal. Diseña un plan de 7 días.
-    Perfil: Peso: {peso_actual}kg | Grasa: {grasa_actual}% (Visceral: {visfat_actual}) | Agua: {agua_actual}% | FFM: {fat_free_weight}kg.
+    Perfil: Peso: {peso_actual}kg | Grasa: {grasa_actual}% (Visceral: {visfat_actual}) | FFM: {fat_free_weight}kg | BMR: {bmr_actual} kcal.
     Macros diarios: Kcal: {calorias} | P: {proteina}g | C: {carbs}g | G: {grasas}g.
+    
+    REGLA DE SEGURIDAD CLÍNICA: Mi Tasa Metabólica Basal (BMR) es de {bmr_actual} Kcal. Jamás debes recomendarme comer por debajo de este número para no dañar mi metabolismo.
 
     REGLAS DE ESTILO DE VIDA (ESTRICTAS):
     1. LUNES, MIERCOLES Y JUEVES (Oficina y Gym Pesado): Salgo 4pm, entreno 45 min en gym, ceno 6pm. Cenas deben ser saciantes. El lonche es SIEMPRE la sobra de la cena anterior.
-    2. MARTES Y VIERNES (Home Office y Bebé): Entreno en casa 30 min aprovechando la siesta del bebé. DAME UNA SUGERENCIA DE RUTINA/EJERCICIO EXACTO PARA ESTOS 30 MINUTOS EN CASA.
+    2. MARTES Y VIERNES (Home Office y Bebé): Entreno en casa 30 min aprovechando la siesta del bebé. DAME UNA SUGERENCIA DE RUTINA EXACTA PARA ESTOS 30 MIN.
     3. FIN DE SEMANA: Sugiéreme un tiempo activo o actividad de recuperación.
-    4. Desayunos: Ultra-rápidos (<5 mins) y portátiles para comer en el auto camino a la oficina.
-    5. Snacks/Frutas: INCLUYE SIEMPRE 1 colación al día basada en FRUTAS FRESCAS para controlar antojos y dar vitaminas, ajustando las porciones de la cena para no pasarnos de calorías.
+    4. Desayunos: Ultra-rápidos (<5 mins) y portátiles para el auto.
+    5. Snacks/Frutas: INCLUYE SIEMPRE 1 colación al día basada en FRUTAS FRESCAS, ajustando las porciones de la cena para no pasarnos de calorías.
     
     REGLA ESTRICTA DE FORMATO: Usa SOLO etiquetas <b> e <i> para resaltar. Usa saltos de línea reales (\\n) y guiones (-) para listas. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3>, <p> o cualquier otra etiqueta HTML."""
     
@@ -189,12 +194,13 @@ def ejecutar_job():
         return enviar_mensaje_telegram("⚠️ Error al contactar IA para generar menú.")
 
     mensaje_telegram = (
-        f"🤖 <b>CONTROL METABÓLICO V4.0</b> 🤖\n\n"
+        f"🤖 <b>CONTROL METABÓLICO V4.3</b> 🤖\n\n"
         f"📊 <b>Telemetría Semanal Completa:</b>\n"
         f"• Peso: {peso_actual:.1f} kg (Δ {delta_peso:+.2f} kg)\n"
         f"• Grasa: {grasa_actual:.1f}% (Δ {delta_grasa:+.2f} %)\n"
         f"• Músculo Esquelético: {musculo_actual_pct:.1f}% (Δ {delta_musculo_pct:+.2f} %)\n"
         f"• Masa Libre de Grasa (FFM): {fat_free_weight:.1f} kg\n"
+        f"• Tasa Metabólica Basal (BMR): {bmr_actual} kcal 🚨\n"
         f"• Agua Corporal: {agua_actual:.1f}%\n"
         f"• Grasa Visceral: {visfat_actual}\n"
         f"• Edad Metabólica: {edad_metabolica} años\n\n"
