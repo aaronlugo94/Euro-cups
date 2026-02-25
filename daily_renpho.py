@@ -101,7 +101,17 @@ def manejar_historial(metricas):
 def analizar_con_ia(m, datos_ayer):
     log("🧠 Generando análisis clínico...")
     client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
-    contexto_ayer = f"Ayer el peso fue {datos_ayer['peso']}kg (Variación: {round(m['peso'] - datos_ayer['peso'], 2):+.2f}kg)." if datos_ayer else ""
+    
+    # 🧠 INYECCIÓN DE CONTEXTO TEMPORAL PARA LA IA
+    contexto_ayer = ""
+    if datos_ayer:
+        contexto_ayer = (
+            f"\n--- COMPARATIVA VS AYER ---\n"
+            f"Peso: {datos_ayer['peso']}kg -> {m['peso']}kg (Variación: {m['peso'] - datos_ayer['peso']:+.2f}kg)\n"
+            f"Grasa: {datos_ayer['grasa']}% -> {m['grasa']}%\n"
+            f"Músculo: {datos_ayer['masa_muscular_kg']}kg -> {m['masa_muscular_kg']}kg\n"
+            f"Agua: {datos_ayer['agua']}% -> {m['agua']}%\n"
+        )
 
     prompt = f"""Analiza estas métricas de salud:
     - Peso: {m['peso']}kg | BMI: {m['bmi']}
@@ -110,11 +120,11 @@ def analizar_con_ia(m, datos_ayer):
     - Agua: {m['agua']}% | Proteína: {m['proteina']}%
     - Edad Metabólica: {m['edad_metabolica']} años
     {contexto_ayer}
-    Actúa como experto en recomposición corporal. Responde SOLO en este formato estricto HTML:
-    <b>📊 Análisis Clínico:</b> (Breve impacto)\n\n
+    Actúa como experto en recomposición corporal. Analiza la comparativa con ayer: ¿es mejora real, empeoramiento o simple ruido hídrico? Responde SOLO en este formato estricto HTML:
+    <b>📊 Análisis Diario:</b> (Impacto y evaluación del cambio)\n\n
     <b>🎯 Acción del Día:</b> (Nutrición/Entrenamiento)\n\n
     <i>🔥 Foco: (1 frase motivadora)</i>
-    REGLA ESTRICTA: Usa SOLO etiquetas <b> e <i> para resaltar. PROHIBIDO usar <br>, <hr>, <ul>, <li> o cualquier otra etiqueta."""
+    REGLA ESTRICTA: Usa SOLO etiquetas <b> e <i> para resaltar. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3> o cualquier otra etiqueta."""
     
     for intento in range(3):
         try:
@@ -128,8 +138,10 @@ def enviar_telegram(mensaje):
     if DRY_RUN: return log(f"DRY RUN: {mensaje}")
     url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
     
-    # 🧹 FILTRO SANITARIO AGRESIVO
-    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n").replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
+    # 🧹 FILTRO SANITARIO AGRESIVO ACTUALIZADO
+    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
+    mensaje = mensaje.replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
+    mensaje = mensaje.replace("<h1>", "").replace("</h1>", "\n").replace("<h2>", "").replace("</h2>", "\n").replace("<h3>", "").replace("</h3>", "\n")
     
     payload = {"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "HTML"}
     
@@ -141,19 +153,42 @@ def enviar_telegram(mensaje):
         if res2.status_code != 200:
             log(f"⚠️ Error CRÍTICO en fallback: {res2.text}")
 
+# 🚦 FUNCIÓN HELPER PARA LOS SEMÁFOROS
+def calcular_delta(hoy, ayer, invert_colors=False):
+    if ayer is None: return ""
+    diff = hoy - ayer
+    if abs(diff) < 0.05: return " ⚪" # Neutral
+    
+    if invert_colors: # Para Peso y Grasa (Bajar es Bueno 🟢)
+        emoji = "🟢" if diff < 0 else "🔴"
+    else:             # Para Músculo y Agua (Subir es Bueno 🟢)
+        emoji = "🟢" if diff > 0 else "🔴"
+        
+    return f" (Δ {diff:+.1f} {emoji})"
+
 def ejecutar_diario():
     try:
         m = obtener_datos_renpho()
         ayer, ya_existia = manejar_historial(m)
-        #if ya_existia: return True 
         
+        # ⚠️ Ponle el hashtag a la línea de abajo (# if ya_existia:...) SOLO si quieres probarlo AHORITA MISMO.
+        # Recuerda quitárselo cuando termines la prueba para que vuelva a quedar protegido.
+        if ya_existia: return True 
+        
+        # Calculamos visuales
+        d_peso = calcular_delta(m['peso'], ayer['peso'], invert_colors=True) if ayer else ""
+        d_grasa = calcular_delta(m['grasa'], ayer['grasa'], invert_colors=True) if ayer else ""
+        d_musc = calcular_delta(m['masa_muscular_kg'], ayer['masa_muscular_kg'], invert_colors=False) if ayer else ""
+        d_agua = calcular_delta(m['agua'], ayer['agua'], invert_colors=False) if ayer else ""
+
         analisis = analizar_con_ia(m, ayer)
+        
         reporte = (
             f"📊 <b>REPORTE DE SALUD AVANZADO</b>\n\n"
-            f"⚖️ <b>Peso:</b> {m['peso']} kg (BMI: {m['bmi']})\n"
-            f"💪 <b>Masa Muscular:</b> {m['masa_muscular_kg']} kg 👈\n"
-            f"🥓 <b>Grasa:</b> {m['grasa']}% (Visceral: {m['grasa_visceral']})\n"
-            f"💧 <b>Agua:</b> {m['agua']}% | 🥩 <b>Prot:</b> {m['proteina']}%\n"
+            f"⚖️ <b>Peso:</b> {m['peso']} kg{d_peso}\n"
+            f"💪 <b>Masa Muscular:</b> {m['masa_muscular_kg']} kg{d_musc}\n"
+            f"🥓 <b>Grasa:</b> {m['grasa']}%{d_grasa} (Visceral: {m['grasa_visceral']})\n"
+            f"💧 <b>Agua:</b> {m['agua']}%{d_agua}\n"
             f"📅 <b>Edad Metabólica:</b> {m['edad_metabolica']} años\n\n"
             f"🤖 <b>Análisis IA:</b>\n{analisis}"
         )
