@@ -1,228 +1,219 @@
 import os
+import json
 import sqlite3
-import pandas as pd
-from google import genai
 import requests
-import logging
+import pytz
+import time
 from datetime import datetime, timedelta
-from pytz import timezone
+from google import genai
+from renpho import RenphoClient 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-TZ = timezone(os.getenv("TZ", "America/Phoenix"))
+TZ = pytz.timezone(os.getenv("TZ", "America/Phoenix")) 
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ARCHIVO_DB = "/app/data/mis_datos_renpho.db"
+def log(msg):
+    timestamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}")
 
-# ==========================================
-# ESTADO & TELEGRAM
-# ==========================================
-def inicializar_bd(ruta_db):
-    conexion = sqlite3.connect(ruta_db)
-    cursor = conexion.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS config_nutricion (clave TEXT PRIMARY KEY, valor REAL)")
-    cursor.execute("INSERT OR IGNORE INTO config_nutricion (clave, valor) VALUES ('kcal_mult', 26.0)")
-    cursor.execute('''CREATE TABLE IF NOT EXISTS historico_dietas (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, fecha TEXT, peso REAL, grasa REAL, delta_peso REAL,
-        kcal_mult REAL, calorias INTEGER, proteina INTEGER, carbs INTEGER, grasas INTEGER, dieta_html TEXT)''')
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_hist_fecha ON historico_dietas(fecha)")
+REQUIRED_VARS = ["RENPHO_EMAIL", "RENPHO_PASSWORD", "GOOGLE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+env_vars = {var: os.getenv(var) for var in REQUIRED_VARS}
+if not all(env_vars.values()):
+    raise RuntimeError(f"❌ Faltan variables de entorno: {', '.join([v for v, k in env_vars.items() if not k])}")
+
+def obtener_datos_renpho():
+    log("🔄 Extrayendo telemetría de Renpho...")
+    try:
+        cliente = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
+        mediciones = None
+        try: mediciones = cliente.get_all_measurements()
+        except: pass
+            
+        if not mediciones:
+            user_id = cliente.user_id
+            devices = cliente.get_device_info()
+            mac = devices[0].get('mac', '') if devices else ''
+            mediciones = cliente.get_measurements(table_name=mac, user_id=user_id, total_count=10)
+
+        if not mediciones: raise ValueError("No se encontraron mediciones.")
+
+        # Tomar la medición más reciente
+        mediciones = sorted(mediciones, key=lambda x: x.get("time_stamp", 0), reverse=True)
+        u = mediciones[0]
+        
+        # Extraemos el timestamp exacto para saber si es un pesaje nuevo
+        timestamp_exacto = u.get("time_stamp")
+        fecha_logica = datetime.fromtimestamp(timestamp_exacto, TZ).strftime('%Y-%m-%d')
+        
+        return {
+            "time_stamp": timestamp_exacto, "fecha_str": fecha_logica,
+            "peso": u.get("weight"), "grasa": u.get("bodyfat"), "agua": u.get("water"),
+            "bmi": u.get("bmi"), "bmr": u.get("bmr"), "edad_metabolica": u.get("bodyage"),
+            "grasa_visceral": u.get("visfat"), "masa_muscular_kg": u.get("sinew"),
+            "musculo_pct": u.get("muscle"), "fat_free_weight": u.get("fatFreeWeight"),
+            "proteina": u.get("protein"), "masa_osea": u.get("bone")
+        }
+    except Exception as e:
+        raise RuntimeError(f"Error en extracción: {e}")
+
+def es_pesaje_nuevo(timestamp_actual):
+    ruta_estado = "/app/data/ultimo_pesaje.txt"
+    os.makedirs(os.path.dirname(ruta_estado), exist_ok=True)
+    if os.path.exists(ruta_estado):
+        with open(ruta_estado, "r") as f:
+            ultimo_ts = f.read().strip()
+            if str(timestamp_actual) == ultimo_ts:
+                return False # Ya procesamos este pesaje
+    return True # Es un pesaje completamente nuevo
+
+def marcar_como_procesado(timestamp_actual):
+    ruta_estado = "/app/data/ultimo_pesaje.txt"
+    with open(ruta_estado, "w") as f:
+        f.write(str(timestamp_actual))
+
+def guardar_en_sqlite(m):
+    log("💾 Persistiendo en SQLite (Single Source of Truth)...")
+    db_path = "/app/data/mis_datos_renpho.db"
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS pesajes (
+                Fecha TEXT PRIMARY KEY, Peso_kg REAL, Grasa_Porcentaje REAL, Agua REAL, 
+                Musculo REAL, BMR INTEGER, VisFat REAL, BMI REAL, EdadMetabolica INTEGER, FatFreeWeight REAL
+            )
+        ''')
+        cur.execute('''
+            INSERT OR REPLACE INTO pesajes 
+            (Fecha, Peso_kg, Grasa_Porcentaje, Agua, Musculo, BMR, VisFat, BMI, EdadMetabolica, FatFreeWeight)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (m['fecha_str'], m['peso'], m['grasa'], m['agua'], m['musculo_pct'], 
+              m['bmr'], m['grasa_visceral'], m['bmi'], m['edad_metabolica'], m['fat_free_weight']))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"⚠️ Error SQLite: {e}")
+
+def obtener_comparativa_semana(fecha_actual_str):
+    db_path = "/app/data/mis_datos_renpho.db"
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Buscar el pesaje más cercano a hace 7 días (mínimo 6 días atrás para ser precisos)
+        cursor.execute('''
+            SELECT Peso_kg, Grasa_Porcentaje, Musculo, Agua 
+            FROM pesajes 
+            WHERE Fecha <= date(?, '-6 day') 
+            ORDER BY Fecha DESC LIMIT 1
+        ''', (fecha_actual_str,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {"peso": row[0], "grasa": row[1], "musculo_pct": row[2], "agua": row[3]}
+    except: pass
+    return None
+
+def analizar_con_ia(m, semana_pasada):
+    log("🧠 Generando análisis clínico...")
+    client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
     
-    # Migración en caliente: Añadir columnas MIMO si no existen
-    try: cursor.execute("ALTER TABLE historico_dietas ADD COLUMN estado_mimo TEXT")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE historico_dietas ADD COLUMN shadow_mult REAL")
-    except sqlite3.OperationalError: pass
+    contexto_comparativo = ""
+    if semana_pasada:
+        contexto_comparativo = (
+            f"\n--- COMPARATIVA VS HACE UNA SEMANA ---\n"
+            f"Peso: {semana_pasada['peso']}kg -> {m['peso']}kg (Variación: {m['peso'] - semana_pasada['peso']:+.2f}kg)\n"
+            f"Grasa: {semana_pasada['grasa']}% -> {m['grasa']}%\n"
+            f"Músculo: {semana_pasada['musculo_pct']}% -> {m['musculo_pct']}%\n"
+            f"Agua: {semana_pasada['agua']}% -> {m['agua']}%\n"
+        )
+
+    prompt = f"""Analiza estas métricas de salud:
+    - Peso: {m['peso']}kg | BMI: {m['bmi']}
+    - Músculo Esquelético: {m['musculo_pct']}%
+    - Grasa Corporal: {m['grasa']}% | Visceral: {m['grasa_visceral']}
+    - Agua: {m['agua']}% | Proteína: {m['proteina']}%
+    - Edad Metabólica: {m['edad_metabolica']} años
+    {contexto_comparativo}
+    Actúa como experto en recomposición corporal. Analiza la comparativa de 7 días: ¿Vamos en la dirección correcta? Responde SOLO en este formato estricto HTML:
+    <b>📊 Análisis de la Semana:</b> (Impacto y evaluación de la tendencia de 7 días)\n\n
+    <b>🎯 Acción del Día:</b> (Nutrición/Entrenamiento)\n\n
+    <i>🔥 Foco: (1 frase motivadora)</i>
+    REGLA ESTRICTA: Usa SOLO etiquetas <b> e <i> para resaltar. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3> o cualquier otra etiqueta."""
     
-    conexion.commit()
-    conexion.close()
+    for intento in range(3):
+        try:
+            respuesta = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            if respuesta and respuesta.text: return respuesta.text.strip()
+        except Exception as e:
+            if intento == 2: return f"<i>⚠️ Error conectando con motor analítico: {e}</i>"
+            time.sleep(2)
 
-def obtener_estado_actual(ruta_db):
-    conexion = sqlite3.connect(ruta_db)
-    row = conexion.cursor().execute("SELECT valor FROM config_nutricion WHERE clave='kcal_mult'").fetchone()
-    conexion.close()
-    return float(row[0]) if row else 26.0
-
-def actualizar_estado(ruta_db, nuevo_mult):
-    conexion = sqlite3.connect(ruta_db)
-    conexion.cursor().execute("UPDATE config_nutricion SET valor=? WHERE clave='kcal_mult'", (nuevo_mult,))
-    conexion.commit()
-    conexion.close()
-
-def enviar_mensaje_telegram(mensaje):
-    if DRY_RUN: return logging.info(f"DRY RUN: {mensaje}")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def enviar_telegram(mensaje):
+    if DRY_RUN: return log(f"DRY RUN: {mensaje}")
+    url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
     
-    # 🧹 FILTRO SANITARIO AGRESIVO 
     mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
     mensaje = mensaje.replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
     mensaje = mensaje.replace("<h1>", "").replace("</h1>", "\n").replace("<h2>", "").replace("</h2>", "\n").replace("<h3>", "").replace("</h3>", "\n")
     
-    partes = []
-    while len(mensaje) > 0:
-        if len(mensaje) <= 3900:
-            partes.append(mensaje)
-            break
-        corte = mensaje.rfind('\n\n', 0, 3900)
-        if corte == -1: corte = mensaje.rfind('\n', 0, 3900)
-        if corte == -1: corte = 3900
-        partes.append(mensaje[:corte])
-        mensaje = mensaje[corte:].lstrip()
+    payload = {"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "HTML"}
+    res = requests.post(url, json=payload)
+    if res.status_code != 200:
+        log(f"⚠️ Telegram rechazó el HTML. Fallback a texto plano...")
+        del payload["parse_mode"]
+        requests.post(url, json=payload)
+
+def calcular_delta(hoy, ayer, invert_colors=False):
+    if ayer is None: return ""
+    diff = hoy - ayer
+    if abs(diff) < 0.05: return " ⚪" 
+    
+    if invert_colors: # Para Peso y Grasa (Bajar es Bueno 🟢)
+        emoji = "🟢" if diff < 0 else "🔴"
+    else:             # Para Músculo y Agua (Subir es Bueno 🟢)
+        emoji = "🟢" if diff > 0 else "🔴"
         
-    for parte in partes:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": parte, "parse_mode": "HTML"}
-        res = requests.post(url, json=payload)
-        if res.status_code != 200:
-            logging.error(f"⚠️ Error HTML en Telegram: {res.text}. Enviando texto plano...")
-            del payload["parse_mode"]
-            res2 = requests.post(url, json=payload)
-            if res2.status_code != 200:
-                logging.error(f"⚠️ Error CRÍTICO en fallback: {res2.text}")
+    return f" (Δ {diff:+.1f} {emoji})"
 
-# ==========================================
-# LEYES DE CONTROL (MIMO SHADOW & SISO ACTIVO)
-# ==========================================
-def evaluar_estado_metabolico(delta_peso, delta_grasa, delta_musculo, kcal_mult_actual):
-    TOL = 0.2
-    if delta_peso < -0.8 and delta_musculo < -TOL and delta_grasa > -TOL:
-        estado, mult, macros, razon = "CATABOLISMO", kcal_mult_actual + 1, "Aumentar carbs peri-entrenamiento.", f"Pérdida de peso ({delta_peso:+.2f}kg) y músculo ({delta_musculo:+.2f}%) sin quema clara de grasa. Estrés."
-    elif abs(delta_peso) <= 0.3 and delta_grasa < -TOL and delta_musculo > TOL:
-        estado, mult, macros, razon = "RECOMPOSICION", kcal_mult_actual, "Mantener proteína en límite superior.", f"Peso estable con recomposición: Grasa ({delta_grasa:+.2f}%), Músculo ({delta_musculo:+.2f}%)."
-    elif delta_peso <= -0.3 and delta_grasa < -TOL and abs(delta_musculo) <= TOL:
-        estado, mult, macros, razon = "CUTTING_LIMPIO", kcal_mult_actual, "Déficit funcionando.", f"Pérdida de peso controlada ({delta_peso:+.2f}kg) de tejido adiposo."
-    elif delta_peso > -0.2 and delta_grasa >= -TOL and delta_musculo <= TOL:
-        estado, mult, macros, razon = "ESTANCAMIENTO", kcal_mult_actual - 1, "Forzar oxidación de lípidos.", "Adaptación metabólica sin mejora en composición."
-    else:
-        estado, mult, macros, razon = "ZONA_GRIS", kcal_mult_actual, "Observar tendencia.", "Señales mixtas o ruido hídrico. Requiere más datos."
-    
-    return estado, max(20.0, min(mult, 34.0)), macros, razon
-
-def aplicar_ley_de_control(delta_peso, kcal_mult_actual):
-    nuevo_mult, cambio = kcal_mult_actual, False
-    if delta_peso < -0.8:
-        nuevo_mult += 1; razon = "📉 Pérdida rápida. Aumento multiplicador para proteger músculo."; cambio = True
-    elif delta_peso > -0.2:
-        nuevo_mult -= 1; razon = "🛑 Estancamiento. Recorto multiplicador calórico."; cambio = True
-    else:
-        razon = "✅ Progreso óptimo. Mantengo multiplicador."
-    
-    nuevo_mult_seguro = max(20.0, min(nuevo_mult, 34.0))
-    if nuevo_mult_seguro != nuevo_mult: razon += f" (Limitado a {nuevo_mult_seguro})"
-    return nuevo_mult_seguro, razon, cambio
-
-# ==========================================
-# JOB PRINCIPAL
-# ==========================================
-def ejecutar_job():
-    logging.info("Iniciando Job Semanal de Control Metabólico...")
-    
-    # 🛡️ PROTECCIÓN DE IDEMPOTENCIA
-    hoy = datetime.now(TZ).strftime("%Y-%m-%d")
-    inicializar_bd(ARCHIVO_DB)
-    conn = sqlite3.connect(ARCHIVO_DB)
-    existe = conn.cursor().execute("SELECT 1 FROM historico_dietas WHERE fecha LIKE ? LIMIT 1", (f"{hoy}%",)).fetchone()
-    if existe:
-        logging.warning("⚠️ Job semanal ya ejecutado hoy. Abortando por idempotencia.")
-        conn.close()
-        return
-    
-    # ⬇️ AQUI AGREGAMOS BMR A LA CONSULTA SQL ⬇️
-    df = pd.read_sql_query("SELECT Fecha, Peso_kg, Grasa_Porcentaje, Musculo, FatFreeWeight, Agua, VisFat, BMI, EdadMetabolica, BMR FROM pesajes WHERE Fecha >= date('now', '-14 day') ORDER BY Fecha ASC", conn)
-    conn.close()
-
-    if df.empty or len(df) < 2:
-        return enviar_mensaje_telegram("⚠️ Error: Necesito al menos 2 pesajes recientes para calcular la dieta.")
-
-    df['Fecha'] = pd.to_datetime(df['Fecha']).dt.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT').dt.tz_convert(TZ)
-    dato_actual = df.iloc[-1]
-    fecha_hace_una_semana = datetime.now(TZ) - timedelta(days=7)
-    df['diff_dias'] = (df['Fecha'] - fecha_hace_una_semana).abs()
-    dato_anterior = df.loc[df['diff_dias'].idxmin()]
-    
-    peso_actual, grasa_actual = float(dato_actual['Peso_kg']), float(dato_actual['Grasa_Porcentaje'])
-    fat_free_weight = float(dato_actual['FatFreeWeight'])
-    musculo_actual_pct = float(dato_actual['Musculo'])
-    agua_actual = float(dato_actual['Agua'])
-    visfat_actual = float(dato_actual['VisFat'])
-    edad_metabolica = int(dato_actual['EdadMetabolica'])
-    bmr_actual = int(dato_actual['BMR']) # ⬅️ EXTRAEMOS EL BMR
-    
-    delta_peso = peso_actual - float(dato_anterior['Peso_kg'])
-    delta_grasa = grasa_actual - float(dato_anterior['Grasa_Porcentaje'])
-    delta_musculo_pct = musculo_actual_pct - float(dato_anterior['Musculo'])
-    
-    kcal_mult_actual = obtener_estado_actual(ARCHIVO_DB)
-
+def ejecutar_diario():
     try:
-        estado_mimo, shadow_mult, shadow_macros, shadow_razon = evaluar_estado_metabolico(delta_peso, delta_grasa, delta_musculo_pct, kcal_mult_actual)
-        logging.info(f"[SHADOW_MIMO] estado={estado_mimo} | kcal_actual={kcal_mult_actual:.1f} | kcal_sugerido={shadow_mult:.1f} | Δpeso={delta_peso:.2f}kg | Δgrasa={delta_grasa:.2f}% | Δmusculo={delta_musculo_pct:.2f}%")
-        logging.info(f"[SHADOW_MIMO] razon={shadow_razon}")
+        m = obtener_datos_renpho()
+        
+        # EL GUARDIA DE SEGURIDAD: Revisa si ya te habías pesado
+        if not es_pesaje_nuevo(m['time_stamp']):
+            log("💤 No hay pesajes nuevos en la báscula. Ignorando silenciosamente.")
+            return True # Retorna True para no bloquear el Job de Dieta en Domingo
+        
+        # Si llegamos aquí, ¡TE ACABAS DE PESAR!
+        log("🚀 ¡Nuevo pesaje detectado! Procesando comparativa...")
+        guardar_en_sqlite(m)
+        semana_pasada = obtener_comparativa_semana(m['fecha_str'])
+        
+        # Calculamos visuales
+        d_peso = calcular_delta(m['peso'], semana_pasada['peso'], invert_colors=True) if semana_pasada else ""
+        d_grasa = calcular_delta(m['grasa'], semana_pasada['grasa'], invert_colors=True) if semana_pasada else ""
+        d_musc = calcular_delta(m['musculo_pct'], semana_pasada['musculo_pct'], invert_colors=False) if semana_pasada else ""
+        d_agua = calcular_delta(m['agua'], semana_pasada['agua'], invert_colors=False) if semana_pasada else ""
+
+        analisis = analizar_con_ia(m, semana_pasada)
+        
+        reporte = (
+            f"📊 <b>REPORTE DE SALUD (VS HACE 7 DÍAS)</b>\n\n"
+            f"⚖️ <b>Peso:</b> {m['peso']} kg{d_peso}\n"
+            f"💪 <b>Músculo Esquelético:</b> {m['musculo_pct']}%{d_musc}\n"
+            f"🥓 <b>Grasa:</b> {m['grasa']}%{d_grasa} (Visceral: {m['grasa_visceral']})\n"
+            f"💧 <b>Agua:</b> {m['agua']}%{d_agua}\n"
+            f"📅 <b>Edad Metabólica:</b> {m['edad_metabolica']} años\n\n"
+            f"🤖 <b>Análisis IA:</b>\n{analisis}"
+        )
+        enviar_telegram(reporte)
+        
+        # Guardamos la estampa de tiempo para no volver a mandarlo hoy
+        marcar_como_procesado(m['time_stamp'])
+        log("✅ Flujo de pesaje completado y notificado.")
+        return True
     except Exception as e:
-        logging.exception(f"[SHADOW_MIMO] Error: {e}")
-        estado_mimo, shadow_mult, shadow_macros, shadow_razon = "ERROR", kcal_mult_actual, "Shadow Mode falló.", "Error evaluación MIMO."
-
-    nuevo_mult, razon_control, hubo_cambio = aplicar_ley_de_control(delta_peso, kcal_mult_actual)
-    if hubo_cambio: actualizar_estado(ARCHIVO_DB, nuevo_mult)
-
-    calorias = round(peso_actual * nuevo_mult)
-    proteina = round(fat_free_weight * 2.2) 
-    grasas = round(peso_actual * 0.7) 
-    carbs = max(0, round((calorias - (proteina * 4 + grasas * 9)) / 4))
-
-    # 🧠 EL CEREBRO ACTUALIZADO CON CANDADO DE SEGURIDAD BASAL
-    prompt = f"""Eres mi nutriólogo deportivo y entrenador personal. Diseña un plan de 7 días.
-    Perfil: Peso: {peso_actual}kg | Grasa: {grasa_actual}% (Visceral: {visfat_actual}) | FFM: {fat_free_weight}kg | BMR: {bmr_actual} kcal.
-    Macros diarios: Kcal: {calorias} | P: {proteina}g | C: {carbs}g | G: {grasas}g.
-    
-    REGLA DE SEGURIDAD CLÍNICA: Mi Tasa Metabólica Basal (BMR) es de {bmr_actual} Kcal. Jamás debes recomendarme comer por debajo de este número para no dañar mi metabolismo.
-
-    REGLAS DE ESTILO DE VIDA (ESTRICTAS):
-    1. LUNES, MIERCOLES Y JUEVES (Oficina y Gym Pesado): Salgo 4pm, entreno 45 min en gym, ceno 6pm. Cenas deben ser saciantes. El lonche es SIEMPRE la sobra de la cena anterior.
-    2. MARTES Y VIERNES (Home Office y Bebé): Entreno en casa 30 min aprovechando la siesta del bebé. DAME UNA SUGERENCIA DE RUTINA EXACTA PARA ESTOS 30 MIN.
-    3. FIN DE SEMANA: Sugiéreme un tiempo activo o actividad de recuperación.
-    4. Desayunos: Ultra-rápidos (<5 mins) y portátiles para el auto.
-    5. Snacks/Frutas: INCLUYE SIEMPRE 1 colación al día basada en FRUTAS FRESCAS, ajustando las porciones de la cena para no pasarnos de calorías.
-    
-    REGLA ESTRICTA DE FORMATO: Usa SOLO etiquetas <b> e <i> para resaltar. Usa saltos de línea reales (\\n) y guiones (-) para listas. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3>, <p> o cualquier otra etiqueta HTML."""
-    
-    try:
-        client = genai.Client()
-        respuesta = client.models.generate_content(model='gemini-2.5-pro', contents=prompt)
-        if not respuesta or not hasattr(respuesta, "text") or not respuesta.text.strip(): raise ValueError("Respuesta IA vacía.")
-        dieta_html = respuesta.text.strip()
-    except Exception as e:
-        return enviar_mensaje_telegram("⚠️ Error al contactar IA para generar menú.")
-
-    mensaje_telegram = (
-        f"🤖 <b>CONTROL METABÓLICO V4.3</b> 🤖\n\n"
-        f"📊 <b>Telemetría Semanal Completa:</b>\n"
-        f"• Peso: {peso_actual:.1f} kg (Δ {delta_peso:+.2f} kg)\n"
-        f"• Grasa: {grasa_actual:.1f}% (Δ {delta_grasa:+.2f} %)\n"
-        f"• Músculo Esquelético: {musculo_actual_pct:.1f}% (Δ {delta_musculo_pct:+.2f} %)\n"
-        f"• Masa Libre de Grasa (FFM): {fat_free_weight:.1f} kg\n"
-        f"• Tasa Metabólica Basal (BMR): {bmr_actual} kcal 🚨\n"
-        f"• Agua Corporal: {agua_actual:.1f}%\n"
-        f"• Grasa Visceral: {visfat_actual}\n"
-        f"• Edad Metabólica: {edad_metabolica} años\n\n"
-        f"🧠 <b>Acción del Sistema (SISO):</b>\n"
-        f"<i>{razon_control}</i>\n"
-        f"Multiplicador actual: {nuevo_mult} kcal/kg\n\n"
-        f"🎯 <b>Macros Bio-Ajustados:</b>\n"
-        f"Kcal: {calorias} | P: {proteina}g | C: {carbs}g | G: {grasas}g\n\n"
-        f"🥗 <b>TU MENÚ Y ENTRENAMIENTO:</b>\n\n{dieta_html}\n\n"
-        f"👻 <b>Shadow Mode (MIMO):</b>\n"
-        f"• Estado: <b>{estado_mimo}</b>\n"
-        f"• Mult. Sugerido: {shadow_mult}\n"
-        f"• Diagnóstico: <i>{shadow_razon}</i>"
-    )
-    enviar_mensaje_telegram(mensaje_telegram)
-    
-    conexion = sqlite3.connect(ARCHIVO_DB)
-    conexion.cursor().execute('''INSERT INTO historico_dietas (fecha, peso, grasa, delta_peso, kcal_mult, calorias, proteina, carbs, grasas, dieta_html, estado_mimo, shadow_mult)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"), peso_actual, grasa_actual, delta_peso, nuevo_mult, calorias, proteina, carbs, grasas, dieta_html, estado_mimo, shadow_mult))
-    conexion.commit()
-    conexion.close()
-    logging.info("Job ejecutado exitosamente.")
+        log(f"🔴 Error Crítico en Ingesta: {e}")
+        return False
 
 if __name__ == "__main__":
-    ejecutar_job()
+    ejecutar_diario()
