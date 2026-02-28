@@ -1,201 +1,323 @@
+"""
+daily_renpho.py — V6.0 Production Grade
+Cambios vs V5.1 (Gemini):
+  1. INSERT OR IGNORE + rowcount  → atomicidad real sin race condition
+  2. Context managers (with)       → conexiones SQLite garantizadas cerradas
+  3. analizar_con_ia con fallback  → nunca retorna None
+  4. Prompt monolingüe (español)   → inferencia más predecible
+  5. logging con exc_info          → trazas completas en cada error
+  6. Validación de None pre-delta  → no más TypeError en f-strings
+"""
+
 import os
-import json
 import sqlite3
 import requests
 import pytz
 import time
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime
 from google import genai
-from renpho import RenphoClient 
+from renpho import RenphoClient
 
-TZ = pytz.timezone(os.getenv("TZ", "America/Phoenix")) 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+TZ      = pytz.timezone(os.getenv("TZ", "America/Phoenix"))
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+DB_PATH = "/app/data/mis_datos_renpho.db"
 
-def log(msg):
-    timestamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
-
-REQUIRED_VARS = ["RENPHO_EMAIL", "RENPHO_PASSWORD", "GOOGLE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+REQUIRED_VARS = [
+    "RENPHO_EMAIL", "RENPHO_PASSWORD",
+    "GOOGLE_API_KEY",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+]
 env_vars = {var: os.getenv(var) for var in REQUIRED_VARS}
-if not all(env_vars.values()):
-    raise RuntimeError(f"❌ Faltan variables de entorno: {', '.join([v for v, k in env_vars.items() if not k])}")
+faltantes = [v for v, k in env_vars.items() if not k]
+if faltantes:
+    raise RuntimeError(f"Faltan variables de entorno: {', '.join(faltantes)}")
 
-def obtener_datos_renpho():
-    log("🔄 Extrayendo telemetría de Renpho...")
-    try:
-        cliente = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
-        mediciones = None
-        try: mediciones = cliente.get_all_measurements()
-        except: pass
-            
-        if not mediciones:
-            user_id = cliente.user_id
-            devices = cliente.get_device_info()
-            mac = devices[0].get('mac', '') if devices else ''
-            mediciones = cliente.get_measurements(table_name=mac, user_id=user_id, total_count=10)
 
-        if not mediciones: raise ValueError("No se encontraron mediciones.")
+# ─── BASE DE DATOS ─────────────────────────────────────────────────────────────
 
-        # Tomar la medición más reciente
-        mediciones = sorted(mediciones, key=lambda x: x.get("time_stamp", 0), reverse=True)
-        u = mediciones[0]
-        
-        # Extraemos el timestamp exacto para saber si es un pesaje nuevo
-        timestamp_exacto = u.get("time_stamp")
-        fecha_logica = datetime.fromtimestamp(timestamp_exacto, TZ).strftime('%Y-%m-%d')
-        
-        return {
-            "time_stamp": timestamp_exacto, "fecha_str": fecha_logica,
-            "peso": u.get("weight"), "grasa": u.get("bodyfat"), "agua": u.get("water"),
-            "bmi": u.get("bmi"), "bmr": u.get("bmr"), "edad_metabolica": u.get("bodyage"),
-            "grasa_visceral": u.get("visfat"), "masa_muscular_kg": u.get("sinew"),
-            "musculo_pct": u.get("muscle"), "fat_free_weight": u.get("fatFreeWeight"),
-            "proteina": u.get("protein"), "masa_osea": u.get("bone")
-        }
-    except Exception as e:
-        raise RuntimeError(f"Error en extracción: {e}")
-
-def es_pesaje_nuevo(timestamp_actual):
-    ruta_estado = "/app/data/ultimo_pesaje.txt"
-    os.makedirs(os.path.dirname(ruta_estado), exist_ok=True)
-    if os.path.exists(ruta_estado):
-        with open(ruta_estado, "r") as f:
-            ultimo_ts = f.read().strip()
-            if str(timestamp_actual) == ultimo_ts:
-                return False # Ya procesamos este pesaje
-    return True # Es un pesaje completamente nuevo
-
-def marcar_como_procesado(timestamp_actual):
-    ruta_estado = "/app/data/ultimo_pesaje.txt"
-    with open(ruta_estado, "w") as f:
-        f.write(str(timestamp_actual))
-
-def guardar_en_sqlite(m):
-    log("💾 Persistiendo en SQLite (Single Source of Truth)...")
-    db_path = "/app/data/mis_datos_renpho.db"
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute('''
+def inicializar_db():
+    """Crea la tabla y aplica migraciones en caliente si hacen falta."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS pesajes (
-                Fecha TEXT PRIMARY KEY, Peso_kg REAL, Grasa_Porcentaje REAL, Agua REAL, 
-                Musculo REAL, BMR INTEGER, VisFat REAL, BMI REAL, EdadMetabolica INTEGER, FatFreeWeight REAL
+                Fecha          TEXT PRIMARY KEY,
+                Peso_kg        REAL,
+                Grasa_Porcentaje REAL,
+                Agua           REAL,
+                Musculo        REAL,
+                BMR            INTEGER,
+                VisFat         REAL,
+                BMI            REAL,
+                EdadMetabolica INTEGER,
+                FatFreeWeight  REAL,
+                Timestamp      INTEGER UNIQUE   -- UNIQUE es la clave anti race-condition
             )
-        ''')
-        cur.execute('''
-            INSERT OR REPLACE INTO pesajes 
-            (Fecha, Peso_kg, Grasa_Porcentaje, Agua, Musculo, BMR, VisFat, BMI, EdadMetabolica, FatFreeWeight)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (m['fecha_str'], m['peso'], m['grasa'], m['agua'], m['musculo_pct'], 
-              m['bmr'], m['grasa_visceral'], m['bmi'], m['edad_metabolica'], m['fat_free_weight']))
+        """)
+        # Migración en caliente: añade Timestamp si la tabla ya existía sin ella
+        columnas = {row[1] for row in conn.execute("PRAGMA table_info(pesajes)")}
+        if "Timestamp" not in columnas:
+            conn.execute("ALTER TABLE pesajes ADD COLUMN Timestamp INTEGER UNIQUE")
+            logging.info("Migración aplicada: columna Timestamp añadida.")
+        # Índices para queries eficientes con 500+ registros
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON pesajes (Timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fecha ON pesajes (Fecha)")
         conn.commit()
-        conn.close()
-    except Exception as e:
-        log(f"⚠️ Error SQLite: {e}")
 
-def obtener_comparativa_semana(fecha_actual_str):
-    db_path = "/app/data/mis_datos_renpho.db"
+
+def guardar_si_es_nuevo(m: dict) -> bool:
+    """
+    Intenta insertar el pesaje usando INSERT OR IGNORE.
+    Retorna True si se insertó (es nuevo), False si ya existía.
+
+    ATOMICIDAD REAL: SQLite gestiona el UNIQUE constraint en Timestamp.
+    No hay SELECT previo, no hay ventana de race condition.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO pesajes
+            (Fecha, Peso_kg, Grasa_Porcentaje, Agua, Musculo,
+             BMR, VisFat, BMI, EdadMetabolica, FatFreeWeight, Timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            m["fecha_str"], m["peso"], m["grasa"], m["agua"], m["musculo_pct"],
+            m["bmr"], m["grasa_visceral"], m["bmi"], m["edad_metabolica"],
+            m["fat_free_weight"], m["time_stamp"],
+        ))
+        conn.commit()
+        insertado = cur.rowcount == 1  # 0 = ya existía (IGNORE), 1 = nuevo
+
+    if insertado:
+        logging.info("💾 Pesaje persistido en SQLite.")
+    else:
+        logging.info("💤 Timestamp ya existente en BD. Pesaje duplicado ignorado.")
+
+    return insertado
+
+
+def obtener_comparativa_semana(fecha_actual_str: str) -> dict | None:
+    """Busca el pesaje más cercano a hace 7 días (mínimo 6 días atrás)."""
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        # Buscar el pesaje más cercano a hace 7 días (mínimo 6 días atrás para ser precisos)
-        cursor.execute('''
-            SELECT Peso_kg, Grasa_Porcentaje, Musculo, Agua 
-            FROM pesajes 
-            WHERE Fecha <= date(?, '-6 day') 
-            ORDER BY Fecha DESC LIMIT 1
-        ''', (fecha_actual_str,))
-        row = cursor.fetchone()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("""
+                SELECT Peso_kg, Grasa_Porcentaje, Musculo, Agua
+                FROM pesajes
+                WHERE Fecha <= date(?, '-6 day')
+                ORDER BY Fecha DESC
+                LIMIT 1
+            """, (fecha_actual_str,)).fetchone()
+
         if row:
             return {"peso": row[0], "grasa": row[1], "musculo_pct": row[2], "agua": row[3]}
-    except: pass
+
+    except Exception:
+        logging.warning("No se pudo obtener comparativa semanal.", exc_info=True)
+
     return None
 
-def analizar_con_ia(m, semana_pasada):
-    log("🧠 Generando análisis clínico...")
+
+# ─── EXTRACCIÓN RENPHO ─────────────────────────────────────────────────────────
+
+def obtener_datos_renpho() -> dict:
+    logging.info("🔄 Extrayendo telemetría de Renpho...")
+    try:
+        cliente  = RenphoClient(env_vars["RENPHO_EMAIL"], env_vars["RENPHO_PASSWORD"])
+        mediciones = None
+
+        try:
+            mediciones = cliente.get_all_measurements()
+        except Exception as e:
+            logging.warning(f"get_all_measurements falló: {e}. Intentando fallback por MAC...")
+
+        if not mediciones:
+            devices = cliente.get_device_info()
+            if not devices:
+                raise ValueError("No hay dispositivos vinculados a la cuenta Renpho.")
+            mac = devices[0].get("mac")
+            if not mac:
+                raise ValueError("El dispositivo no tiene dirección MAC.")
+            mediciones = cliente.get_measurements(
+                table_name=mac, user_id=cliente.user_id, total_count=10
+            )
+
+        if not mediciones:
+            raise ValueError("La API de Renpho devolvió lista vacía de mediciones.")
+
+        u = max(mediciones, key=lambda x: x.get("time_stamp", 0))
+
+        ts = u.get("time_stamp")
+        if not ts:
+            raise ValueError("La medición no tiene timestamp válido.")
+
+        datos = {
+            "time_stamp":      ts,
+            "fecha_str":       datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d"),
+            "peso":            u.get("weight"),
+            "grasa":           u.get("bodyfat"),
+            "agua":            u.get("water"),
+            "bmi":             u.get("bmi"),
+            "bmr":             u.get("bmr"),
+            "edad_metabolica": u.get("bodyage"),
+            "grasa_visceral":  u.get("visfat"),
+            "masa_muscular_kg":u.get("sinew"),
+            "musculo_pct":     u.get("muscle"),
+            "fat_free_weight": u.get("fatFreeWeight"),
+            "proteina":        u.get("protein"),
+            "masa_osea":       u.get("bone"),
+        }
+
+        # Validación estricta de campos críticos para los cálculos de delta
+        campos_criticos = ["peso", "grasa", "musculo_pct", "agua"]
+        nulos = [c for c in campos_criticos if datos.get(c) is None]
+        if nulos:
+            raise ValueError(f"Datos corruptos/faltantes de la báscula: {nulos}")
+
+        return datos
+
+    except Exception:
+        logging.error("Error crítico extrayendo datos de Renpho.", exc_info=True)
+        raise
+
+
+# ─── ANÁLISIS IA ───────────────────────────────────────────────────────────────
+
+def analizar_con_ia(m: dict, semana_pasada: dict | None) -> str:
+    """
+    Genera análisis clínico con Gemini.
+    GARANTÍA: siempre retorna un string, nunca None.
+    """
+    logging.info("🧠 Generando análisis clínico con IA...")
     client = genai.Client(api_key=env_vars["GOOGLE_API_KEY"])
-    
-    contexto_comparativo = ""
+
+    comparativa = ""
     if semana_pasada:
-        contexto_comparativo = (
-            f"\n--- COMPARATIVA VS HACE UNA SEMANA ---\n"
-            f"Peso: {semana_pasada['peso']}kg -> {m['peso']}kg (Variación: {m['peso'] - semana_pasada['peso']:+.2f}kg)\n"
-            f"Grasa: {semana_pasada['grasa']}% -> {m['grasa']}%\n"
-            f"Músculo: {semana_pasada['musculo_pct']}% -> {m['musculo_pct']}%\n"
-            f"Agua: {semana_pasada['agua']}% -> {m['agua']}%\n"
+        comparativa = (
+            "\n--- COMPARATIVA VS HACE 7 DÍAS ---\n"
+            f"Peso:    {semana_pasada['peso']} kg  →  {m['peso']} kg  "
+            f"(variación: {m['peso'] - semana_pasada['peso']:+.2f} kg)\n"
+            f"Grasa:   {semana_pasada['grasa']}%  →  {m['grasa']}%\n"
+            f"Músculo: {semana_pasada['musculo_pct']}%  →  {m['musculo_pct']}%\n"
+            f"Agua:    {semana_pasada['agua']}%  →  {m['agua']}%\n"
         )
 
-    prompt = f"""Analiza estas métricas de salud:
-    - Peso: {m['peso']}kg | BMI: {m['bmi']}
-    - Músculo Esquelético: {m['musculo_pct']}%
-    - Grasa Corporal: {m['grasa']}% | Visceral: {m['grasa_visceral']}
-    - Agua: {m['agua']}% | Proteína: {m['proteina']}%
-    - Edad Metabólica: {m['edad_metabolica']} años
-    {contexto_comparativo}
-    Actúa como experto en recomposición corporal. Analiza la comparativa de 7 días: ¿Vamos en la dirección correcta? Responde SOLO en este formato estricto HTML:
-    <b>📊 Análisis de la Semana:</b> (Impacto y evaluación de la tendencia de 7 días)\n\n
-    <b>🎯 Acción del Día:</b> (Nutrición/Entrenamiento)\n\n
-    <i>🔥 Foco: (1 frase motivadora)</i>
-    REGLA ESTRICTA: Usa SOLO etiquetas <b> e <i> para resaltar. PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3> o cualquier otra etiqueta."""
-    
+    # Prompt monolingüe en español, estructurado y sin ambigüedad
+    prompt = f"""Eres un experto en recomposición corporal. Analiza las siguientes métricas y responde ÚNICAMENTE en el formato HTML indicado.
+
+MÉTRICAS DE HOY:
+- Peso: {m['peso']} kg  |  BMI: {m['bmi']}
+- Músculo esquelético: {m['musculo_pct']}%
+- Grasa corporal: {m['grasa']}%  |  Visceral: {m['grasa_visceral']}
+- Agua: {m['agua']}%  |  Proteína: {m['proteina']}%
+- Edad metabólica: {m['edad_metabolica']} años
+{comparativa}
+
+INSTRUCCIÓN: ¿Vamos en la dirección correcta? Evalúa la tendencia de 7 días y responde SOLO con este bloque, sin texto adicional:
+
+<b>📊 Análisis de la Semana:</b> [evaluación de la tendencia]
+
+<b>🎯 Acción del Día:</b> [recomendación concreta de nutrición o entrenamiento]
+
+<i>🔥 Foco: [una frase motivadora]</i>
+
+REGLA: Usa ÚNICAMENTE las etiquetas <b> e <i>. Está PROHIBIDO usar <br>, <hr>, <ul>, <li>, <h1>, <h2>, <h3> o cualquier otra etiqueta HTML."""
+
     for intento in range(3):
         try:
-            respuesta = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-            if respuesta and respuesta.text: return respuesta.text.strip()
+            respuesta = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            texto = respuesta.text.strip() if respuesta and respuesta.text else ""
+            if texto:
+                return texto
+            logging.warning(f"Intento {intento + 1}: respuesta vacía de Gemini.")
         except Exception as e:
-            if intento == 2: return f"<i>⚠️ Error conectando con motor analítico: {e}</i>"
-            time.sleep(2)
+            logging.warning(f"Intento {intento + 1} fallido: {e}")
+            if intento < 2:
+                time.sleep(2)
 
-def enviar_telegram(mensaje):
-    if DRY_RUN: return log(f"DRY RUN: {mensaje}")
-    url = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
-    
-    mensaje = mensaje.replace("<br>", "\n").replace("<br/>", "\n").replace("<ul>", "").replace("</ul>", "").replace("<li>", "• ").replace("</li>", "\n")
-    mensaje = mensaje.replace("<hr>", "---").replace("<hr/>", "---").replace("<p>", "").replace("</p>", "\n").replace("<strong>", "<b>").replace("</strong>", "</b>")
-    mensaje = mensaje.replace("<h1>", "").replace("</h1>", "\n").replace("<h2>", "").replace("</h2>", "\n").replace("<h3>", "").replace("</h3>", "\n")
-    
+    # Fallback garantizado — nunca retorna None
+    logging.error("Gemini falló tras 3 intentos. Usando fallback de análisis.")
+    return "<i>⚠️ Análisis de IA no disponible temporalmente. Revisa los logs.</i>"
+
+
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
+
+_HTML_SANITIZE = [
+    ("<br>", "\n"), ("<br/>", "\n"), ("<br />", "\n"),
+    ("<ul>", ""), ("</ul>", ""), ("<li>", "• "), ("</li>", "\n"),
+    ("<hr>", "---"), ("<hr/>", "---"),
+    ("<p>", ""), ("</p>", "\n"),
+    ("<strong>", "<b>"), ("</strong>", "</b>"),
+    ("<h1>", ""), ("</h1>", "\n"),
+    ("<h2>", ""), ("</h2>", "\n"),
+    ("<h3>", ""), ("</h3>", "\n"),
+]
+
+def enviar_telegram(mensaje: str) -> None:
+    if DRY_RUN:
+        logging.info(f"[DRY RUN] Mensaje Telegram:\n{mensaje}")
+        return
+
+    for old, new in _HTML_SANITIZE:
+        mensaje = mensaje.replace(old, new)
+
+    url     = f"https://api.telegram.org/bot{env_vars['TELEGRAM_BOT_TOKEN']}/sendMessage"
     payload = {"chat_id": env_vars["TELEGRAM_CHAT_ID"], "text": mensaje, "parse_mode": "HTML"}
-    res = requests.post(url, json=payload)
-    if res.status_code != 200:
-        log(f"⚠️ Telegram rechazó el HTML. Fallback a texto plano...")
-        del payload["parse_mode"]
-        requests.post(url, json=payload)
 
-def calcular_delta(hoy, ayer, invert_colors=False):
-    if ayer is None: return ""
+    res = requests.post(url, json=payload, timeout=10)
+    if res.status_code == 200:
+        return
+
+    logging.warning(f"Telegram rechazó HTML ({res.status_code}): {res.text}. Reintentando en texto plano...")
+    payload.pop("parse_mode")
+    res2 = requests.post(url, json=payload, timeout=10)
+    if res2.status_code != 200:
+        logging.error(f"Error crítico enviando a Telegram: {res2.text}")
+
+
+# ─── UTILIDADES ───────────────────────────────────────────────────────────────
+
+def calcular_delta(hoy: float, ayer: float | None, invert_colors: bool = False) -> str:
+    """Retorna string vacío si ayer es None — evita TypeError en f-strings."""
+    if ayer is None:
+        return ""
     diff = hoy - ayer
-    if abs(diff) < 0.05: return " ⚪" 
-    
-    if invert_colors: # Para Peso y Grasa (Bajar es Bueno 🟢)
-        emoji = "🟢" if diff < 0 else "🔴"
-    else:             # Para Músculo y Agua (Subir es Bueno 🟢)
-        emoji = "🟢" if diff > 0 else "🔴"
-        
+    if abs(diff) < 0.05:
+        return " ⚪"
+    emoji = ("🟢" if diff < 0 else "🔴") if invert_colors else ("🟢" if diff > 0 else "🔴")
     return f" (Δ {diff:+.1f} {emoji})"
 
-def ejecutar_diario():
+
+# ─── FLUJO PRINCIPAL ──────────────────────────────────────────────────────────
+
+def ejecutar_diario() -> bool:
     try:
+        inicializar_db()
         m = obtener_datos_renpho()
-        
-        # EL GUARDIA DE SEGURIDAD: Revisa si ya te habías pesado
-        if not es_pesaje_nuevo(m['time_stamp']):
-            log("💤 No hay pesajes nuevos en la báscula. Ignorando silenciosamente.")
-            return True # Retorna True para no bloquear el Job de Dieta en Domingo
-        
-        # Si llegamos aquí, ¡TE ACABAS DE PESAR!
-        log("🚀 ¡Nuevo pesaje detectado! Procesando comparativa...")
-        guardar_en_sqlite(m)
-        semana_pasada = obtener_comparativa_semana(m['fecha_str'])
-        
-        # Calculamos visuales
-        d_peso = calcular_delta(m['peso'], semana_pasada['peso'], invert_colors=True) if semana_pasada else ""
-        d_grasa = calcular_delta(m['grasa'], semana_pasada['grasa'], invert_colors=True) if semana_pasada else ""
-        d_musc = calcular_delta(m['musculo_pct'], semana_pasada['musculo_pct'], invert_colors=False) if semana_pasada else ""
-        d_agua = calcular_delta(m['agua'], semana_pasada['agua'], invert_colors=False) if semana_pasada else ""
+
+        # Atomicidad real: INSERT OR IGNORE decide si es nuevo sin race condition
+        if not guardar_si_es_nuevo(m):
+            return True  # Silencioso: no bloquea job_dieta.py los domingos
+
+        logging.info("🚀 Nuevo pesaje detectado. Generando reporte...")
+        semana_pasada = obtener_comparativa_semana(m["fecha_str"])
+
+        # Los None ya están validados en obtener_datos_renpho, pero calcular_delta
+        # también los maneja por si acaso (defensa en profundidad)
+        d_peso  = calcular_delta(m["peso"],        semana_pasada["peso"] if semana_pasada else None, invert_colors=True)
+        d_grasa = calcular_delta(m["grasa"],       semana_pasada["grasa"] if semana_pasada else None, invert_colors=True)
+        d_musc  = calcular_delta(m["musculo_pct"], semana_pasada["musculo_pct"] if semana_pasada else None)
+        d_agua  = calcular_delta(m["agua"],        semana_pasada["agua"] if semana_pasada else None)
 
         analisis = analizar_con_ia(m, semana_pasada)
-        
+
         reporte = (
             f"📊 <b>REPORTE DE SALUD (VS HACE 7 DÍAS)</b>\n\n"
             f"⚖️ <b>Peso:</b> {m['peso']} kg{d_peso}\n"
@@ -205,15 +327,16 @@ def ejecutar_diario():
             f"📅 <b>Edad Metabólica:</b> {m['edad_metabolica']} años\n\n"
             f"🤖 <b>Análisis IA:</b>\n{analisis}"
         )
+
         enviar_telegram(reporte)
-        
-        # Guardamos la estampa de tiempo para no volver a mandarlo hoy
-        marcar_como_procesado(m['time_stamp'])
-        log("✅ Flujo de pesaje completado y notificado.")
+        logging.info("✅ Flujo de pesaje completado y notificado.")
         return True
-    except Exception as e:
-        log(f"🔴 Error Crítico en Ingesta: {e}")
+
+    except Exception:
+        logging.error("🔴 Error crítico en el flujo diario.", exc_info=True)
+        enviar_telegram("🔴 <b>Error Crítico — Sistema Renpho:</b> Revisa los logs en Railway.")
         return False
+
 
 if __name__ == "__main__":
     ejecutar_diario()
