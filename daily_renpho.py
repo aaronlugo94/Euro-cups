@@ -95,21 +95,24 @@ def inicializar_db():
             )
         """)
         # Migración en caliente para BDs existentes con esquema viejo
+        # CRÍTICO: ALTER TABLE no soporta UNIQUE — la unicidad la maneja
+        # el CREATE UNIQUE INDEX de abajo, que sí es compatible con migraciones
         columnas = {row[1] for row in conn.execute("PRAGMA table_info(pesajes)")}
         migraciones = {
-            "Timestamp":       "INTEGER UNIQUE",
-            "Musculo_kg":      "REAL",
-            "FatFreeWeight":   "REAL",
-            "Proteina":        "REAL",
-            "MasaOsea":        "REAL",
+            "Timestamp":     "INTEGER",  # Sin UNIQUE aquí
+            "Musculo_kg":    "REAL",
+            "FatFreeWeight": "REAL",
+            "Proteina":      "REAL",
+            "MasaOsea":      "REAL",
         }
         for col, tipo in migraciones.items():
             if col not in columnas:
                 conn.execute(f"ALTER TABLE pesajes ADD COLUMN {col} {tipo}")
                 logging.info(f"Migración aplicada: columna {col} añadida.")
 
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON pesajes (Timestamp)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_fecha     ON pesajes (Fecha)")
+        # UNIQUE INDEX — equivalente al constraint pero compatible con ALTER TABLE
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_timestamp ON pesajes (Timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fecha ON pesajes (Fecha)")
         conn.commit()
 
 
