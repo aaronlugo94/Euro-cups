@@ -383,8 +383,15 @@ def enviar_telegram(mensaje: str) -> None:
 # ─── JOB PRINCIPAL ────────────────────────────────────────────────────────────
 
 def ejecutar_job():
-    logging.info("🚀 Iniciando Job Semanal de Control Metabólico V5.0...")
+    logging.info("🚀 Iniciando Job Semanal de Control Metabólico V5.1...")
     inicializar_bd()
+
+    # ── Filtro de día: solo corre los domingos ────────────────────────────────
+    # Como el cron es diario, este guardia evita que corra lunes-sábado
+    hoy = datetime.now(TZ)
+    if hoy.weekday() != 6:  # 6 = domingo
+        logging.info(f"Hoy es {hoy.strftime('%A')}. El job de dieta solo corre los domingos. Omitiendo.")
+        return
 
     with sqlite3.connect(DB_PATH) as conn:
 
