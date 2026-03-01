@@ -44,29 +44,48 @@ if faltantes:
     raise RuntimeError(f"Faltan variables de entorno: {', '.join(faltantes)}")
 
 
-# ─── RANGOS CLÍNICOS DE REFERENCIA ────────────────────────────────────────────
-# Usados para clasificar cada métrica y generar alertas automáticas.
-# Ajusta los rangos según tu perfil (edad, sexo, objetivo).
+# ─── RANGOS CLÍNICOS — CALIBRADOS AL PERFIL DE AARON ─────────────────────────
+# Hombre adulto, 112kg, 72kg músculo, objetivo: reducir visceral y grasa
+# manteniendo masa muscular. Rangos ajustados a su punto de partida real.
+#
+# LÓGICA DE CALIBRACIÓN:
+# - Grasa: arranca en 32.6% → objetivo realista 6 meses: <25% → largo plazo: <20%
+# - Músculo: ya tiene 43.5% → mantener >42% es éxito, crecer a >45% es meta
+# - Agua: 48.6% indica inflamación → objetivo inmediato: >52%, largo plazo: >55%
+# - Visceral: 14 es zona de riesgo metabólico → objetivo: bajar a <10 en 3 meses
+# - Proteína corporal: 15.4% es bajo → objetivo: >16.5%
 
 RANGOS = {
-    "bmi":            {"optimo": (18.5, 24.9), "alerta": (25.0, 29.9), "critico": (30.0, 99)},
-    "grasa_hombre":   {"optimo": (10.0, 20.0), "alerta": (20.1, 25.0), "critico": (25.1, 100)},
-    "visceral":       {"optimo": (1,    9),    "alerta": (10,   14),   "critico": (15,   30)},
-    "agua":           {"optimo": (50.0, 65.0), "alerta": (45.0, 49.9), "critico": (0,    44.9)},
-    "proteina":       {"optimo": (16.0, 20.0), "alerta": (14.0, 15.9), "critico": (0,    13.9)},
+    "bmi":          {"optimo": (18.5, 27.0), "alerta": (27.1, 32.0), "critico": (32.1, 99)},
+    # BMI ajustado: con 72kg de músculo el BMI clásico es engañoso.
+    # 27 es "alerta" para población general pero aceptable para atletas.
+    # Crítico a partir de 32 donde el riesgo cardiovascular es real.
+
+    "grasa_hombre": {"optimo": (20.0, 27.0), "alerta": (27.1, 32.0), "critico": (32.1, 100)},
+    # Rangos progresivos: 20-27% es su zona objetivo realista (no 10-20% genérico
+    # que nunca vería verde y desmotivaría). Crítico >32% donde está hoy.
+
+    "visceral":     {"optimo": (1,    9),    "alerta": (10,   13),   "critico": (14,   30)},
+    # Visceral 14 = crítico hoy. Objetivo: bajar a zona alerta (<14) primero,
+    # luego a óptimo (<10). Este rango motiva ver progreso real.
+
+    "agua":         {"optimo": (53.0, 65.0), "alerta": (49.0, 52.9), "critico": (0,    48.9)},
+    # 48.6% actual = crítico. Objetivo inmediato: pasar a alerta (>49%).
+    # Óptimo bajado a 53% (vs 55% genérico) para que sea alcanzable en 2 meses.
+
+    "proteina":     {"optimo": (16.5, 20.0), "alerta": (15.0, 16.4), "critico": (0,    14.9)},
+    # 15.4% actual = alerta. Objetivo: pasar a óptimo (>16.5%) con mejor timing
+    # de proteína y reducción de inflamación.
 }
 
 def clasificar(valor, metrica):
-    """Retorna emoji de semáforo según rangos clínicos."""
+    """Retorna emoji de semáforo según rangos clínicos calibrados al perfil."""
     if valor is None or metrica not in RANGOS:
         return ""
     r = RANGOS[metrica]
-    if r["optimo"][0] <= valor <= r["optimo"][1]:
-        return " 🟢"
-    elif r["alerta"][0] <= valor <= r["alerta"][1]:
-        return " 🟡"
-    elif r["critico"][0] <= valor <= r["critico"][1]:
-        return " 🔴"
+    if r["optimo"][0] <= valor <= r["optimo"][1]:   return " 🟢"
+    elif r["alerta"][0] <= valor <= r["alerta"][1]: return " 🟡"
+    elif r["critico"][0] <= valor <= r["critico"][1]: return " 🔴"
     return ""
 
 
@@ -310,47 +329,61 @@ def obtener_datos_renpho() -> dict:
 
 def calcular_score_composicion(m: dict) -> tuple[int, str]:
     """
-    Score de 0-100 basado en 4 métricas clave ponderadas.
-    Retorna (score, descripción).
-    Ajusta los pesos y rangos óptimos a tu objetivo personal.
+    Score 0-100 calibrado al perfil real de Aaron.
+    Punto de partida: grasa 32.6%, músculo 43.5%, agua 48.6%, visceral 14.
+    Los umbrales reflejan progreso REAL, no estándares genéricos inalcanzables.
+
+    GRASA (35 pts) — el mayor peso porque es el objetivo principal
+    MÚSCULO (25 pts) — mantener >42% es prioridad, crecer es bonus
+    VISCERAL (25 pts) — más peso que en versión genérica, es el riesgo real
+    AGUA (15 pts) — indicador de inflamación y recuperación
     """
     score = 0
 
-    # Grasa corporal (35 pts) — objetivo: <18%
+    # Grasa corporal (35 pts)
+    # Hoy: 32.6% = 0pts. Meta 3 meses: <27% = verde
     grasa = m.get("grasa", 99)
-    if grasa <= 15:    score += 35
-    elif grasa <= 18:  score += 28
-    elif grasa <= 22:  score += 18
-    elif grasa <= 27:  score += 8
-    else:              score += 0
+    if grasa <= 20:    score += 35   # Excelente — largo plazo
+    elif grasa <= 25:  score += 28   # Muy bueno — meta 6 meses
+    elif grasa <= 27:  score += 20   # Bueno — meta 3 meses
+    elif grasa <= 30:  score += 10   # Progresando
+    elif grasa <= 32:  score += 4    # Punto de partida — algo es algo
+    else:              score += 0    # Punto de partida actual (32.6%)
 
-    # Músculo % (30 pts) — objetivo: >40%
+    # Músculo esquelético % (25 pts)
+    # Hoy: 43.5% — mantener es éxito, crecer es excelente
     musc = m.get("musculo_pct", 0)
-    if musc >= 45:     score += 30
-    elif musc >= 40:   score += 24
-    elif musc >= 35:   score += 15
-    elif musc >= 30:   score += 7
-    else:              score += 0
+    if musc >= 47:     score += 25   # Excepcional
+    elif musc >= 45:   score += 21   # Excelente
+    elif musc >= 43:   score += 17   # Muy bueno — zona actual
+    elif musc >= 40:   score += 11   # Bueno
+    elif musc >= 37:   score += 5    # Aceptable
+    else:              score += 0    # Pérdida muscular — alarma
 
-    # Agua % (20 pts) — objetivo: 55-65%
-    agua = m.get("agua", 0)
-    if 55 <= agua <= 65:  score += 20
-    elif 50 <= agua < 55: score += 14
-    elif agua >= 45:      score += 7
-    else:                 score += 0
-
-    # Grasa visceral (15 pts) — objetivo: ≤9
+    # Grasa visceral (25 pts) — más peso porque es riesgo metabólico real
+    # Hoy: 14 = 0pts. Meta: bajar a <10
     visc = m.get("grasa_visceral", 99)
-    if visc <= 7:    score += 15
-    elif visc <= 9:  score += 11
-    elif visc <= 12: score += 5
-    else:            score += 0
+    if visc <= 7:    score += 25   # Óptimo
+    elif visc <= 9:  score += 20   # Muy bueno
+    elif visc <= 11: score += 13   # Progresando — meta intermedia
+    elif visc <= 13: score += 6    # Alerta pero mejorando
+    else:            score += 0    # Zona de riesgo — punto de partida
 
-    if score >= 80:   desc = "Élite 🏆"
-    elif score >= 65: desc = "Muy bueno 💪"
-    elif score >= 50: desc = "En progreso 📈"
-    elif score >= 35: desc = "Necesita atención ⚠️"
-    else:             desc = "Zona de riesgo 🚨"
+    # Agua corporal % (15 pts) — indicador de inflamación
+    # Hoy: 48.6% = zona crítica
+    agua = m.get("agua", 0)
+    if 55 <= agua <= 65:    score += 15   # Óptimo
+    elif 53 <= agua < 55:   score += 12   # Muy bueno
+    elif 51 <= agua < 53:   score += 8    # Bueno — meta 2 meses
+    elif 49 <= agua < 51:   score += 4    # Mejorando — salir de crítico
+    else:                   score += 0    # Inflamación activa
+
+    # Descripciones contextualizadas al journey de Aaron
+    if score >= 75:   desc = "Élite 🏆"
+    elif score >= 58: desc = "Muy bueno 💪"
+    elif score >= 42: desc = "En progreso 📈"
+    elif score >= 25: desc = "Construyendo base ⚙️"
+    else:             desc = "Día 1 — el camino empieza aquí 🚀"
 
     return score, desc
 
