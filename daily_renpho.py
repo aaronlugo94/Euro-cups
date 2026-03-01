@@ -241,11 +241,32 @@ def obtener_datos_renpho() -> dict:
         if not mediciones:
             raise ValueError("La API de Renpho devolvió lista vacía.")
 
-        u = max(mediciones, key=lambda x: x.get("time_stamp", 0))
+        def extraer_ts(m):
+            return (
+                m.get("time_stamp") or m.get("timeStamp") or
+                m.get("timestamp") or m.get("created_at") or
+                m.get("createTime") or m.get("measureTime") or 0
+            )
 
-        ts = u.get("time_stamp")
+        u = max(mediciones, key=extraer_ts)
+
+        # Diagnóstico: loguear las claves reales que devuelve Renpho
+        # (útil para detectar cambios en la API sin tener que adivinar)
+        logging.info(f"Campos disponibles en medición Renpho: {list(u.keys())}")
+
+        # Renpho ha cambiado el nombre del campo en distintas versiones
+        # Probamos todos los nombres conocidos
+        ts = (
+            u.get("time_stamp") or
+            u.get("timeStamp") or
+            u.get("timestamp") or
+            u.get("created_at") or
+            u.get("createTime") or
+            u.get("measureTime")
+        )
         if not ts:
-            raise ValueError("La medición no tiene timestamp válido.")
+            logging.error(f"No se encontró timestamp. Campos disponibles: {list(u.keys())}")
+            raise ValueError(f"La medición no tiene timestamp válido. Campos: {list(u.keys())}")
 
         datos = {
             "time_stamp":       ts,
